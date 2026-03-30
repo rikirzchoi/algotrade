@@ -1,0 +1,21 @@
+{
+  "risk_appetite": "neutral",
+  "trend_regime": "ranging",
+  "sector_bias": [],
+  "geopolitical_tension": "low",
+  "fed_stance": "neutral",
+  "upcoming_events": [
+    {
+      "date": "2026-04-16",
+      "event": "FOMC meeting minutes",
+      "impact": "high"
+    },
+    {
+      "date": "2026-04-30",
+      "event": "GDP preliminary Q1",
+      "impact": "medium"
+    }
+  ],
+  "notes": "Initial regime config. Update weekly after World Monitor review.",
+  "last_updated": ""
+}
