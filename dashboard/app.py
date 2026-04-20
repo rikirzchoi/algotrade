@@ -1,15 +1,15 @@
 """
-dashboard.app — three-tab Dash monitoring interface.
+dashboard.app — sidebar-navigation Dash monitoring interface.
 
-Tab 1 — Live Operations
+Page 1 — Overview
     Real-time equity curve, open positions, fills, strategy toggles,
-    kill-switch button with confirmation modal.
+    kill-switch in sidebar.
 
-Tab 2 — Performance
+Page 2 — Performance
     Cumulative P&L, drawdown, per-strategy breakdown, monthly heatmap,
     win/loss histogram.
 
-Tab 3 — Health
+Page 3 — Health
     System events log, signal frequency, commission tracker, macro
     regime panel, upcoming events.
 
@@ -66,15 +66,20 @@ def _empty_figure(message: str = "No data yet — waiting for first trade") -> g
 
 
 def _dark_layout(**kwargs) -> dict:
-    """Base dark layout dict merged into every chart."""
+    """Base chart layout dict merged into every figure."""
     base: dict = dict(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#6b7280"),
-        xaxis=dict(gridcolor="#1e1e2a", zeroline=False),
-        yaxis=dict(gridcolor="#1e1e2a", zeroline=False),
+        font=dict(family="Inter, sans-serif", color="#888888"),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.04)", zeroline=False),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.04)", zeroline=False),
         margin=dict(l=50, r=20, t=40, b=40),
         legend=dict(bgcolor="rgba(0,0,0,0)"),
+        hoverlabel=dict(
+            bgcolor="#1c1c1c",
+            bordercolor="#2a2a3a",
+            font=dict(color="#f0f0f0", size=13, family="Inter"),
+        ),
     )
     base.update(kwargs)
     return base
@@ -89,369 +94,78 @@ def _empty_table_row(message: str, cols: int) -> html.Tr:
 
 
 def _pnl_color(value: float) -> str:
-    return "#00e676" if value >= 0 else "#ff5252"
+    return "#00c853" if value >= 0 else "#ff1744"
 
 
 # ---------------------------------------------------------------------------
-# Tab 1 — Live layout
+# Layout style constants
 # ---------------------------------------------------------------------------
 
-def _live_tab(strategy_ids: list[str] | None = None) -> dbc.Tab:
-    return dbc.Tab(
-        label="Live",
-        tab_id="tab-live",
-        children=[
-            dcc.Interval(id="live-interval", interval=5000, n_intervals=0),
+_CARD_STYLE: dict = {
+    "background": "var(--card)",
+    "border": "var(--card-border)",
+    "borderRadius": "16px",
+    "padding": "20px 24px",
+    "boxShadow": "0 1px 4px rgba(0,0,0,0.07)",
+    "height": "100%",
+}
 
-            # Row 1 — Status cards
-            dbc.Row([
-                dbc.Col(dbc.Card(dbc.CardBody([
-                    html.P("DAILY PNL", style={
-                        "fontSize": "12px", "textTransform": "uppercase",
-                        "letterSpacing": "0.08em", "color": "#6b7280", "marginBottom": "8px",
-                    }),
-                    html.H3(id="status-daily-pnl", children="$0.00", className="mb-0",
-                            style={"fontSize": "28px", "fontWeight": "600"}),
-                ]), style={
-                    "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                    "borderRadius": "12px", "borderTop": "2px solid #f5a623",
-                    "padding": "20px 24px",
-                }, className="h-100"), width=3),
+_CHART_CONTAINER_STYLE: dict = {
+    "background": "var(--card)",
+    "border": "var(--card-border)",
+    "borderRadius": "16px",
+    "padding": "8px",
+    "boxShadow": "0 1px 4px rgba(0,0,0,0.07)",
+}
 
-                dbc.Col(dbc.Card(dbc.CardBody([
-                    html.P("DRAWDOWN", style={
-                        "fontSize": "12px", "textTransform": "uppercase",
-                        "letterSpacing": "0.08em", "color": "#6b7280", "marginBottom": "8px",
-                    }),
-                    html.H3(id="status-drawdown", children="0.00%", className="mb-0",
-                            style={"fontSize": "28px", "fontWeight": "600"}),
-                ]), style={
-                    "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                    "borderRadius": "12px", "borderTop": "2px solid #f5a623",
-                    "padding": "20px 24px",
-                }, className="h-100"), width=3),
-
-                dbc.Col(dbc.Card(dbc.CardBody([
-                    html.P("CONNECTION", style={
-                        "fontSize": "12px", "textTransform": "uppercase",
-                        "letterSpacing": "0.08em", "color": "#6b7280", "marginBottom": "8px",
-                    }),
-                    html.H3(id="status-connection", children="⬤ Unknown", className="mb-0",
-                            style={"fontSize": "28px", "fontWeight": "600"}),
-                ]), style={
-                    "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                    "borderRadius": "12px", "borderTop": "2px solid #f5a623",
-                    "padding": "20px 24px",
-                }, className="h-100"), width=3),
-
-                dbc.Col(dbc.Card(dbc.CardBody([
-                    html.P("KILL SWITCH", style={
-                        "fontSize": "12px", "textTransform": "uppercase",
-                        "letterSpacing": "0.08em", "color": "#6b7280", "marginBottom": "8px",
-                    }),
-                    html.Div(id="status-halted", children=html.Span(
-                        "Active", style={"color": "#00e676"}
-                    ), style={"fontSize": "28px", "fontWeight": "600"}),
-                    # Persistent Resume button — shown only when halted
-                    dbc.Button(
-                        "Resume",
-                        id="resume-btn",
-                        size="sm",
-                        className="mt-1",
-                        style={
-                            "display": "none",
-                            "background": "#f5a623", "color": "#000",
-                            "border": "none", "borderRadius": "8px",
-                            "fontWeight": "600", "padding": "6px 16px",
-                        },
-                        n_clicks=0,
-                    ),
-                ]), style={
-                    "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                    "borderRadius": "12px", "borderTop": "2px solid #f5a623",
-                    "padding": "20px 24px",
-                }, className="h-100"), width=3),
-            ], className="mb-3 mt-3", style={"gap": "0", "--bs-gutter-x": "12px"}),
-
-            # Row 2 — Live equity curve
-            dbc.Row([
-                dbc.Col(html.Div(
-                    dcc.Graph(id="live-equity-chart", figure=_empty_figure()),
-                    style={
-                        "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                        "borderRadius": "12px", "padding": "8px",
-                    },
-                ), width=12),
-            ], className="mb-3"),
-
-            # Row 3 — Fills + Positions
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Today's Fills", className="mb-2",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(id="fills-table"),
-                ], width=7),
-                dbc.Col([
-                    html.H5("Open Positions", className="mb-2",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(id="positions-table"),
-                ], width=5),
-            ], className="mb-3"),
-
-            # Row 4 — Strategy controls (static cards; badges/buttons updated by interval)
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Strategy Controls", className="mb-2",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(
-                        _build_static_strategy_controls(strategy_ids or []),
-                        id="strategy-controls",
-                    ),
-                    # Hidden output for toggle callbacks
-                    html.Div(id="strategy-toggle-output", style={"display": "none"}),
-                ], width=12),
-            ], className="mb-3"),
-
-            # Row 5 — Kill switch
-            dbc.Row([
-                dbc.Col([
-                    dbc.Button(
-                        "EMERGENCY STOP",
-                        id="kill-switch-btn",
-                        className="w-100 kill-switch-btn",
-                        n_clicks=0,
-                        style={
-                            "background": "transparent",
-                            "border": "2px solid #ff5252",
-                            "color": "#ff5252",
-                            "borderRadius": "8px",
-                            "fontWeight": "700",
-                            "fontSize": "14px",
-                            "letterSpacing": "0.1em",
-                        },
-                    ),
-                    dbc.Modal([
-                        dbc.ModalHeader(dbc.ModalTitle("Confirm Emergency Stop")),
-                        dbc.ModalBody(
-                            "This will immediately halt all trading and cancel all open orders. "
-                            "Are you sure?"
-                        ),
-                        dbc.ModalFooter([
-                            dbc.Button("Cancel", id="kill-switch-cancel",
-                                       color="secondary", className="me-2", n_clicks=0),
-                            dbc.Button("CONFIRM STOP", id="kill-switch-confirm",
-                                       color="danger", n_clicks=0),
-                        ]),
-                    ], id="kill-switch-modal", is_open=False),
-                ], width=12),
-            ], className="mb-3"),
-        ],
-    )
+_BADGE_LONG = {
+    "backgroundColor": "rgba(0,200,83,0.15)", "color": "#00c853",
+    "border": "1px solid #00c853", "borderRadius": "99px",
+    "padding": "2px 10px", "fontSize": "11px", "fontWeight": "600",
+}
+_BADGE_SHORT = {
+    "backgroundColor": "rgba(255,23,68,0.15)", "color": "#ff1744",
+    "border": "1px solid #ff1744", "borderRadius": "99px",
+    "padding": "2px 10px", "fontSize": "11px", "fontWeight": "600",
+}
+_BADGE_ACTIVE_STYLE = {
+    "backgroundColor": "rgba(0,200,83,0.2)", "color": "#00c853",
+    "border": "1px solid #00c853", "borderRadius": "99px",
+    "padding": "3px 10px", "fontSize": "11px", "fontWeight": "600",
+}
+_BADGE_INACTIVE_STYLE = {
+    "backgroundColor": "rgba(255,23,68,0.2)", "color": "#ff1744",
+    "border": "1px solid #ff1744", "borderRadius": "99px",
+    "padding": "3px 10px", "fontSize": "11px", "fontWeight": "600",
+}
+_BTN_TOGGLE_STYLE = {
+    "background": "transparent",
+    "border": "1px solid #6b7280",
+    "color": "#6b7280",
+    "borderRadius": "8px",
+    "fontWeight": "600",
+    "padding": "4px 14px",
+    "fontSize": "12px",
+}
+_CARD_STRATEGY_STYLE = {
+    "background": "var(--card)",
+    "border": "var(--card-border)",
+    "borderRadius": "12px",
+}
 
 
-# ---------------------------------------------------------------------------
-# Tab 2 — Performance layout
-# ---------------------------------------------------------------------------
-
-def _performance_tab() -> dbc.Tab:
-    return dbc.Tab(
-        label="Performance",
-        tab_id="tab-performance",
-        children=[
-            dcc.Interval(id="perf-interval", interval=60_000, n_intervals=0),
-
-            # Row 1 — Summary cards
-            dbc.Row([
-                dbc.Col(dbc.Card(dbc.CardBody([
-                    html.P("TOTAL PNL", style={
-                        "fontSize": "12px", "textTransform": "uppercase",
-                        "letterSpacing": "0.08em", "color": "#6b7280", "marginBottom": "8px",
-                    }),
-                    html.H3(id="perf-total-pnl", children="$0.00",
-                            style={"fontSize": "28px", "fontWeight": "600"}),
-                ]), style={
-                    "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                    "borderRadius": "12px", "borderTop": "2px solid #f5a623",
-                    "padding": "20px 24px",
-                }), width=3),
-                dbc.Col(dbc.Card(dbc.CardBody([
-                    html.P("SHARPE RATIO", style={
-                        "fontSize": "12px", "textTransform": "uppercase",
-                        "letterSpacing": "0.08em", "color": "#6b7280", "marginBottom": "8px",
-                    }),
-                    html.H3(id="perf-sharpe", children="0.00",
-                            style={"fontSize": "28px", "fontWeight": "600", "color": "#e8e8f0"}),
-                ]), style={
-                    "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                    "borderRadius": "12px", "borderTop": "2px solid #f5a623",
-                    "padding": "20px 24px",
-                }), width=3),
-                dbc.Col(dbc.Card(dbc.CardBody([
-                    html.P("MAX DRAWDOWN", style={
-                        "fontSize": "12px", "textTransform": "uppercase",
-                        "letterSpacing": "0.08em", "color": "#6b7280", "marginBottom": "8px",
-                    }),
-                    html.H3(id="perf-max-dd", children="$0.00",
-                            style={"fontSize": "28px", "fontWeight": "600", "color": "#ff5252"}),
-                ]), style={
-                    "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                    "borderRadius": "12px", "borderTop": "2px solid #f5a623",
-                    "padding": "20px 24px",
-                }), width=3),
-                dbc.Col(dbc.Card(dbc.CardBody([
-                    html.P("WIN RATE", style={
-                        "fontSize": "12px", "textTransform": "uppercase",
-                        "letterSpacing": "0.08em", "color": "#6b7280", "marginBottom": "8px",
-                    }),
-                    html.H3(id="perf-win-rate", children="0.0%",
-                            style={"fontSize": "28px", "fontWeight": "600", "color": "#e8e8f0"}),
-                ]), style={
-                    "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                    "borderRadius": "12px", "borderTop": "2px solid #f5a623",
-                    "padding": "20px 24px",
-                }), width=3),
-            ], className="mb-3 mt-3", style={"--bs-gutter-x": "12px"}),
-
-            # Row 2 — Equity + Drawdown
-            dbc.Row([
-                dbc.Col(html.Div(
-                    dcc.Graph(id="perf-equity-chart", figure=_empty_figure()),
-                    style={
-                        "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                        "borderRadius": "12px", "padding": "8px",
-                    },
-                ), width=6),
-                dbc.Col(html.Div(
-                    dcc.Graph(id="perf-drawdown-chart", figure=_empty_figure()),
-                    style={
-                        "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                        "borderRadius": "12px", "padding": "8px",
-                    },
-                ), width=6),
-            ], className="mb-3"),
-
-            # Row 3 — Per-strategy table
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Per-Strategy Breakdown", className="mb-2",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(id="perf-summary-table"),
-                ], width=12),
-            ], className="mb-3"),
-
-            # Row 4 — Monthly heatmap
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Monthly PnL Heatmap", className="mb-2",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(
-                        dcc.Graph(id="monthly-heatmap", figure=_empty_figure()),
-                        style={
-                            "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                            "borderRadius": "12px", "padding": "8px",
-                        },
-                    ),
-                ], width=12),
-            ], className="mb-3"),
-
-            # Row 5 — Win/loss histogram
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Win / Loss Distribution", className="mb-2",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(
-                        dcc.Graph(id="pnl-histogram", figure=_empty_figure()),
-                        style={
-                            "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                            "borderRadius": "12px", "padding": "8px",
-                        },
-                    ),
-                ], width=12),
-            ], className="mb-3"),
-        ],
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tab 3 — Health layout
-# ---------------------------------------------------------------------------
-
-def _health_tab() -> dbc.Tab:
-    return dbc.Tab(
-        label="Health",
-        tab_id="tab-health",
-        children=[
-            # Row 1 — System events
-            dbc.Row([
-                dbc.Col([
-                    html.H5("System Events", className="mb-2 mt-3",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(id="system-events-table"),
-                ], width=12),
-            ], className="mb-3"),
-
-            # Row 2 — Signal frequency + Commission tracker
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Signal Frequency", className="mb-2",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(
-                        dcc.Graph(id="signal-freq-chart", figure=_empty_figure()),
-                        style={
-                            "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                            "borderRadius": "12px", "padding": "8px",
-                        },
-                    ),
-                ], width=6),
-                dbc.Col([
-                    html.H5("Avg Commission per Trade", className="mb-2",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(
-                        dcc.Graph(id="slippage-chart", figure=_empty_figure()),
-                        style={
-                            "background": "#1a1a24", "border": "1px solid #2a2a3a",
-                            "borderRadius": "12px", "padding": "8px",
-                        },
-                    ),
-                ], width=6),
-            ], className="mb-3"),
-
-            # Row 3 — Macro regime
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Macro Regime", className="mb-2",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(id="macro-regime-panel"),
-                ], width=12),
-            ], className="mb-3"),
-
-            # Row 4 — Upcoming events
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Upcoming Events", className="mb-2",
-                            style={"color": "#e8e8f0", "fontWeight": "500"}),
-                    html.Div(id="upcoming-events-table"),
-                ], width=12),
-            ], className="mb-3"),
-        ],
-    )
+def _stat_card(label: str, value_id: str, accent_color: str, default: str = "—",
+               accent_class: str = "") -> dbc.Col:
+    """Stat card with coloured icon accent, uppercase label, and large value."""
+    return dbc.Col(html.Div([
+        html.P(label, className="stat-card-label"),
+        html.H3(id=value_id, children=default, className="stat-card-value mb-0"),
+    ], className=f"stat-card {accent_class}"), width=3)
 
 
 # ---------------------------------------------------------------------------
 # Table builders (shared across callbacks)
 # ---------------------------------------------------------------------------
-
-_BADGE_LONG = {
-    "backgroundColor": "rgba(0,230,118,0.15)", "color": "#00e676",
-    "border": "1px solid #00e676", "borderRadius": "99px",
-    "padding": "2px 10px", "fontSize": "11px", "fontWeight": "600",
-}
-_BADGE_SHORT = {
-    "backgroundColor": "rgba(255,82,82,0.15)", "color": "#ff5252",
-    "border": "1px solid #ff5252", "borderRadius": "99px",
-    "padding": "2px 10px", "fontSize": "11px", "fontWeight": "600",
-}
-
 
 def _build_positions_table(positions: dict) -> dbc.Table:
     headers = [html.Th("Symbol"), html.Th("Quantity"), html.Th("Side")]
@@ -459,7 +173,7 @@ def _build_positions_table(positions: dict) -> dbc.Table:
         return dbc.Table([
             html.Thead(html.Tr(headers)),
             html.Tbody([_empty_table_row("No open positions", 3)]),
-        ], bordered=True, dark=True, hover=True, size="sm")
+        ], bordered=False, hover=True, size="sm")
 
     rows = [
         html.Tr([
@@ -475,7 +189,7 @@ def _build_positions_table(positions: dict) -> dbc.Table:
     return dbc.Table([
         html.Thead(html.Tr(headers)),
         html.Tbody(rows),
-    ], bordered=True, dark=True, hover=True, size="sm")
+    ], bordered=False, hover=True, size="sm")
 
 
 def _build_fills_table(fills_df: pd.DataFrame) -> dbc.Table:
@@ -486,7 +200,7 @@ def _build_fills_table(fills_df: pd.DataFrame) -> dbc.Table:
         return dbc.Table([
             thead,
             html.Tbody([_empty_table_row("No fills today", len(col_headers))]),
-        ], bordered=True, dark=True, hover=True, size="sm")
+        ], bordered=False, hover=True, size="sm")
 
     df = fills_df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
@@ -512,29 +226,7 @@ def _build_fills_table(fills_df: pd.DataFrame) -> dbc.Table:
     return dbc.Table([
         thead,
         html.Tbody(rows),
-    ], bordered=True, dark=True, hover=True, size="sm", responsive=True)
-
-
-_BADGE_ACTIVE_STYLE = {
-    "backgroundColor": "rgba(0,230,118,0.2)", "color": "#00e676",
-    "border": "1px solid #00e676", "borderRadius": "99px",
-    "padding": "3px 10px", "fontSize": "11px", "fontWeight": "600",
-}
-_BADGE_INACTIVE_STYLE = {
-    "backgroundColor": "rgba(255,82,82,0.2)", "color": "#ff5252",
-    "border": "1px solid #ff5252", "borderRadius": "99px",
-    "padding": "3px 10px", "fontSize": "11px", "fontWeight": "600",
-}
-_BTN_TOGGLE_STYLE = {
-    "background": "#f5a623", "color": "#000",
-    "border": "none", "borderRadius": "8px",
-    "fontWeight": "600", "padding": "6px 16px",
-    "fontSize": "12px",
-}
-_CARD_STRATEGY_STYLE = {
-    "background": "#1a1a24", "border": "1px solid #2a2a3a",
-    "borderRadius": "12px",
-}
+    ], bordered=False, hover=True, size="sm", responsive=True)
 
 
 def _build_static_strategy_controls(strategy_ids: list[str]) -> list:
@@ -544,8 +236,9 @@ def _build_static_strategy_controls(strategy_ids: list[str]) -> list:
     cards = []
     for sid in strategy_ids:
         cards.append(dbc.Card(dbc.CardBody(dbc.Row([
-            dbc.Col(html.Strong(sid, style={"color": "#e8e8f0", "fontWeight": "500",
-                                            "fontSize": "14px"}), width=4),
+            dbc.Col(html.Strong(sid, style={
+                "color": "var(--text)", "fontWeight": "500", "fontSize": "14px",
+            }), width=4),
             dbc.Col(dbc.Badge("Active", id=f"badge-{sid}", color="success",
                               style=_BADGE_ACTIVE_STYLE), width=2),
             dbc.Col(dbc.Button(
@@ -557,7 +250,7 @@ def _build_static_strategy_controls(strategy_ids: list[str]) -> list:
             ), width=2),
             dbc.Col(html.Small("Fills today: 0", id=f"fills-{sid}",
                                style={"color": "#6b7280"}), width=4),
-        ], align="center")), className="mb-2", style=_CARD_STRATEGY_STYLE))
+        ], align="center")), className="mb-2 strategy-card", style=_CARD_STRATEGY_STYLE))
     return cards
 
 
@@ -573,8 +266,9 @@ def _build_strategy_controls(state: dict, strategy_ids: list[str]) -> list:
             if getattr(f, "strategy_id", None) == sid
         )
         cards.append(dbc.Card(dbc.CardBody(dbc.Row([
-            dbc.Col(html.Strong(sid, style={"color": "#e8e8f0", "fontWeight": "500",
-                                            "fontSize": "14px"}), width=4),
+            dbc.Col(html.Strong(sid, style={
+                "color": "var(--text)", "fontWeight": "500", "fontSize": "14px",
+            }), width=4),
             dbc.Col(dbc.Badge(
                 "Active" if is_active else "Inactive",
                 color="success" if is_active else "danger",
@@ -589,7 +283,7 @@ def _build_strategy_controls(state: dict, strategy_ids: list[str]) -> list:
             ), width=2),
             dbc.Col(html.Small(f"Fills today: {fill_count}",
                                style={"color": "#6b7280"}), width=4),
-        ], align="center")), className="mb-2", style=_CARD_STRATEGY_STYLE))
+        ], align="center")), className="mb-2 strategy-card", style=_CARD_STRATEGY_STYLE))
 
     return cards
 
@@ -612,7 +306,6 @@ def _build_regime_panel() -> html.Div:
             color="secondary",
         )
 
-    # Determine risk-appetite display from whatever field is available
     state_val = getattr(regime, "state", None)
     risk_appetite = getattr(regime, "risk_appetite", None)
 
@@ -709,7 +402,7 @@ def _build_upcoming_events_table() -> dbc.Table:
             html.Tbody([_empty_table_row(
                 "No upcoming events in regime.json", len(headers)
             )]),
-        ], bordered=True, dark=True, size="sm")
+        ], bordered=False, size="sm")
 
     try:
         upcoming = sorted(
@@ -725,8 +418,8 @@ def _build_upcoming_events_table() -> dbc.Table:
             continue
         impact = str(event.get("impact", "")).lower()
         impact_color = (
-            "#ff5252" if impact == "high"
-            else ("#f5a623" if impact == "medium" else "#00e676")
+            "#ff1744" if impact == "high"
+            else ("#ff9800" if impact == "medium" else "#00c853")
         )
         rows.append(html.Tr([
             html.Td(str(event.get("date", ""))),
@@ -740,10 +433,203 @@ def _build_upcoming_events_table() -> dbc.Table:
             html.Tbody([_empty_table_row(
                 "No upcoming events in regime.json", len(headers)
             )]),
-        ], bordered=True, dark=True, size="sm")
+        ], bordered=False, size="sm")
 
-    return dbc.Table([thead, html.Tbody(rows)],
-                     bordered=True, dark=True, size="sm")
+    return dbc.Table([thead, html.Tbody(rows)], bordered=False, size="sm")
+
+
+# ---------------------------------------------------------------------------
+# Page layouts (replace dbc.Tab children with html.Div pages)
+# ---------------------------------------------------------------------------
+
+def _overview_page(strategy_ids: list[str] | None = None) -> html.Div:
+    """Page 1 — Overview: stat cards, equity curve, fills, positions, strategy controls."""
+    return html.Div(id="page-overview", className="page-content", children=[
+        dcc.Interval(id="live-interval", interval=5000, n_intervals=0),
+
+        # Row 1 — 4 Stat cards
+        dbc.Row([
+            _stat_card("Daily PnL", "status-daily-pnl", "#ff6b2b", "$0.00", "card-accent-orange"),
+            _stat_card("Drawdown",  "status-drawdown",  "#ff1744", "0.00%", "card-accent-red"),
+            _stat_card("Win Rate",  "perf-win-rate",    "#888888", "0.0%",  "card-accent-muted"),
+            _stat_card("Total PnL", "perf-total-pnl",   "#00c853", "$0.00", "card-accent-green"),
+        ], className="mb-4 mt-3", style={"--bs-gutter-x": "16px"}),
+
+        # Row 2 — Live equity curve
+        dbc.Row([
+            dbc.Col(html.Div(
+                dcc.Graph(id="live-equity-chart", figure=_empty_figure()),
+                className="chart-card",
+            ), width=12),
+        ], className="mb-4"),
+
+        # Row 3 — Fills + Positions
+        dbc.Row([
+            dbc.Col([
+                html.H5("Today's Fills", className="mb-2 section-title"),
+                html.Div(id="fills-table"),
+            ], width=7),
+            dbc.Col([
+                html.H5("Open Positions", className="mb-2 section-title"),
+                html.Div(id="positions-table"),
+            ], width=5),
+        ], className="mb-4"),
+
+        # Row 4 — Strategy controls
+        dbc.Row([
+            dbc.Col([
+                html.H5("Strategy Controls", className="mb-2 section-title"),
+                html.Div(
+                    _build_static_strategy_controls(strategy_ids or []),
+                    id="strategy-controls",
+                ),
+                html.Div(id="strategy-toggle-output", style={"display": "none"}),
+            ], width=12),
+        ], className="mb-4"),
+    ])
+
+
+def _performance_page() -> html.Div:
+    """Page 2 — Performance: charts, breakdown table, heatmap, histogram."""
+    return html.Div(id="page-performance", className="page-content",
+                    style={"display": "none"}, children=[
+        dcc.Interval(id="perf-interval", interval=60_000, n_intervals=0),
+
+        # Row 1 — 2 summary cards (win-rate + total-pnl live in overview page)
+        dbc.Row([
+            dbc.Col(html.Div([
+                html.Div(style={
+                    "width": "36px", "height": "36px", "borderRadius": "8px",
+                    "backgroundColor": "#f5a62326",
+                    "display": "flex", "alignItems": "center", "justifyContent": "center",
+                    "marginBottom": "12px",
+                }, children=html.Div(style={
+                    "width": "14px", "height": "14px", "borderRadius": "3px",
+                    "backgroundColor": "#f5a623",
+                })),
+                html.P("SHARPE RATIO", style={
+                    "fontSize": "11px", "textTransform": "uppercase",
+                    "letterSpacing": "0.08em", "color": "var(--text-muted)",
+                    "marginBottom": "6px", "fontWeight": "500",
+                }),
+                html.H3(id="perf-sharpe", children="0.00", className="mb-0", style={
+                    "fontSize": "28px", "fontWeight": "700",
+                    "color": "var(--text)", "lineHeight": "1.1",
+                }),
+            ], style=_CARD_STYLE), width=6),
+
+            dbc.Col(html.Div([
+                html.Div(style={
+                    "width": "36px", "height": "36px", "borderRadius": "8px",
+                    "backgroundColor": "#ff174426",
+                    "display": "flex", "alignItems": "center", "justifyContent": "center",
+                    "marginBottom": "12px",
+                }, children=html.Div(style={
+                    "width": "14px", "height": "14px", "borderRadius": "3px",
+                    "backgroundColor": "#ff1744",
+                })),
+                html.P("MAX DRAWDOWN", style={
+                    "fontSize": "11px", "textTransform": "uppercase",
+                    "letterSpacing": "0.08em", "color": "var(--text-muted)",
+                    "marginBottom": "6px", "fontWeight": "500",
+                }),
+                html.H3(id="perf-max-dd", children="$0.00", className="mb-0", style={
+                    "fontSize": "28px", "fontWeight": "700",
+                    "color": "#ff1744", "lineHeight": "1.1",
+                }),
+            ], style=_CARD_STYLE), width=6),
+        ], className="mb-4 mt-3", style={"--bs-gutter-x": "16px"}),
+
+        # Row 2 — Equity + Drawdown charts
+        dbc.Row([
+            dbc.Col(html.Div(
+                dcc.Graph(id="perf-equity-chart", figure=_empty_figure()),
+                className="chart-card",
+            ), width=6),
+            dbc.Col(html.Div(
+                dcc.Graph(id="perf-drawdown-chart", figure=_empty_figure()),
+                className="chart-card",
+            ), width=6),
+        ], className="mb-4"),
+
+        # Row 3 — Per-strategy table
+        dbc.Row([
+            dbc.Col([
+                html.H5("Per-Strategy Breakdown", className="mb-2 section-title"),
+                html.Div(id="perf-summary-table"),
+            ], width=12),
+        ], className="mb-4"),
+
+        # Row 4 — Monthly heatmap
+        dbc.Row([
+            dbc.Col([
+                html.H5("Monthly PnL Heatmap", className="mb-2 section-title"),
+                html.Div(
+                    dcc.Graph(id="monthly-heatmap", figure=_empty_figure()),
+                    className="chart-card",
+                ),
+            ], width=12),
+        ], className="mb-4"),
+
+        # Row 5 — Win/loss histogram
+        dbc.Row([
+            dbc.Col([
+                html.H5("Win / Loss Distribution", className="mb-2 section-title"),
+                html.Div(
+                    dcc.Graph(id="pnl-histogram", figure=_empty_figure()),
+                    className="chart-card",
+                ),
+            ], width=12),
+        ], className="mb-4"),
+    ])
+
+
+def _health_page() -> html.Div:
+    """Page 3 — Health: system events, signal freq, commission, macro, upcoming."""
+    return html.Div(id="page-health", className="page-content",
+                    style={"display": "none"}, children=[
+        # Row 1 — System events
+        dbc.Row([
+            dbc.Col([
+                html.H5("System Events", className="mb-2 mt-3 section-title"),
+                html.Div(id="system-events-table"),
+            ], width=12),
+        ], className="mb-4"),
+
+        # Row 2 — Signal frequency + Commission tracker
+        dbc.Row([
+            dbc.Col([
+                html.H5("Signal Frequency", className="mb-2 section-title"),
+                html.Div(
+                    dcc.Graph(id="signal-freq-chart", figure=_empty_figure()),
+                    className="chart-card",
+                ),
+            ], width=6),
+            dbc.Col([
+                html.H5("Avg Commission per Trade", className="mb-2 section-title"),
+                html.Div(
+                    dcc.Graph(id="slippage-chart", figure=_empty_figure()),
+                    className="chart-card",
+                ),
+            ], width=6),
+        ], className="mb-4"),
+
+        # Row 3 — Macro regime
+        dbc.Row([
+            dbc.Col([
+                html.H5("Macro Regime", className="mb-2 section-title"),
+                html.Div(id="macro-regime-panel"),
+            ], width=12),
+        ], className="mb-4"),
+
+        # Row 4 — Upcoming events
+        dbc.Row([
+            dbc.Col([
+                html.H5("Upcoming Events", className="mb-2 section-title"),
+                html.Div(id="upcoming-events-table"),
+            ], width=12),
+        ], className="mb-4"),
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -758,7 +644,104 @@ def _register_callbacks(
     """Register all Dash callbacks for live data refresh and interactivity."""
 
     # ------------------------------------------------------------------
-    # Live tab
+    # Sidebar navigation — page switching
+    # ------------------------------------------------------------------
+
+    _NAV_ACTIVE_STYLE = {
+        "background": "#2d2d3d",
+        "color": "#ffffff",
+        "borderRadius": "8px",
+        "padding": "10px 16px",
+        "cursor": "pointer",
+        "fontSize": "14px",
+        "fontWeight": "600",
+        "marginBottom": "4px",
+        "userSelect": "none",
+        "transition": "background 0.15s",
+    }
+    _NAV_INACTIVE_STYLE = {
+        "background": "transparent",
+        "color": "#9ca3af",
+        "borderRadius": "8px",
+        "padding": "10px 16px",
+        "cursor": "pointer",
+        "fontSize": "14px",
+        "marginBottom": "4px",
+        "userSelect": "none",
+        "transition": "background 0.15s",
+    }
+
+    @app.callback(
+        Output("current-page", "data"),
+        [
+            Input("nav-overview", "n_clicks"),
+            Input("nav-performance", "n_clicks"),
+            Input("nav-health", "n_clicks"),
+        ],
+        prevent_initial_call=True,
+    )
+    def set_active_page(n1: int, n2: int, n3: int) -> str:
+        ctx = callback_context
+        if not ctx.triggered:
+            return "overview"
+        btn_id = ctx.triggered[0]["prop_id"].split(".")[0]
+        return {
+            "nav-overview": "overview",
+            "nav-performance": "performance",
+            "nav-health": "health",
+        }.get(btn_id, "overview")
+
+    @app.callback(
+        [
+            Output("page-overview", "style"),
+            Output("page-performance", "style"),
+            Output("page-health", "style"),
+            Output("nav-overview", "style"),
+            Output("nav-performance", "style"),
+            Output("nav-health", "style"),
+            Output("page-header-title", "children"),
+        ],
+        Input("current-page", "data"),
+    )
+    def switch_page(page: str):  # noqa: ANN001
+        show = {"display": "block"}
+        hide = {"display": "none"}
+        titles = {"overview": "Overview", "performance": "Performance", "health": "Health"}
+        return (
+            show if page == "overview" else hide,
+            show if page == "performance" else hide,
+            show if page == "health" else hide,
+            _NAV_ACTIVE_STYLE if page == "overview" else _NAV_INACTIVE_STYLE,
+            _NAV_ACTIVE_STYLE if page == "performance" else _NAV_INACTIVE_STYLE,
+            _NAV_ACTIVE_STYLE if page == "health" else _NAV_INACTIVE_STYLE,
+            titles.get(page, "Overview"),
+        )
+
+    # ------------------------------------------------------------------
+    # Theme toggle
+    # ------------------------------------------------------------------
+
+    @app.callback(
+        Output("theme-store", "data"),
+        Input("theme-toggle", "value"),
+        prevent_initial_call=True,
+    )
+    def update_theme(is_dark: bool) -> str:
+        return "dark" if is_dark else "light"
+
+    app.clientside_callback(
+        """
+        function(theme) {
+            document.body.className = theme === 'dark' ? 'dark-mode' : 'light-mode';
+            return '';
+        }
+        """,
+        Output("theme-applier", "children"),
+        Input("theme-store", "data"),
+    )
+
+    # ------------------------------------------------------------------
+    # Live tab (Overview page)
     # ------------------------------------------------------------------
 
     @app.callback(
@@ -789,8 +772,8 @@ def _register_callbacks(
         dd_pct: float = float(state.get("drawdown_pct", 0.0))
         dd_val = dd_pct * 100
         dd_color = (
-            "#ff5252" if dd_val > 4
-            else ("#f5a623" if dd_val > 2 else "#e8e8f0")
+            "#ff1744" if dd_val > 4
+            else ("#ff9800" if dd_val > 2 else "var(--text)")
         )
         dd_text = html.Span(f"{dd_val:.2f}%", style={"color": dd_color})
 
@@ -810,14 +793,14 @@ def _register_callbacks(
         conn_text = html.Span(
             "⬤ Connected" if connected else "⬤ Disconnected",
             className="connection-dot-connected" if connected else "connection-dot-disconnected",
-            style={"color": "#00e676" if connected else "#ff5252"},
+            style={"color": "#00c853" if connected else "#ff1744"},
         )
 
         # Kill-switch / halted
         is_halted: bool = bool(state.get("is_halted", False))
         if is_halted:
             halted_content = html.Span("HALTED",
-                                       style={"color": "#ff5252", "fontWeight": "bold"})
+                                       style={"color": "#ff1744", "fontWeight": "bold"})
             resume_style = {
                 "display": "inline-block",
                 "background": "#f5a623", "color": "#000",
@@ -825,7 +808,7 @@ def _register_callbacks(
                 "fontWeight": "600", "padding": "6px 16px",
             }
         else:
-            halted_content = html.Span("Active", style={"color": "#00e676"})
+            halted_content = html.Span("Active", style={"color": "#00c853"})
             resume_style = {"display": "none"}
 
         # Equity curve — today's trades
@@ -839,7 +822,7 @@ def _register_callbacks(
                 today_eq = eq_df[eq_df["exit_time"] >= today_start]
                 if not today_eq.empty:
                     fig = go.Figure()
-                    colors = ["#f5a623", "#4488ff", "#00e676", "#ff5252", "#aa44ff"]
+                    colors = ["#ff6b2b", "#4488ff", "#00c853", "#ff1744", "#aa44ff"]
                     for i, (sid, grp) in enumerate(today_eq.groupby("strategy_id")):
                         grp = grp.sort_values("exit_time")
                         fig.add_trace(go.Scatter(
@@ -989,7 +972,7 @@ def _register_callbacks(
         return is_open
 
     # ------------------------------------------------------------------
-    # Performance tab
+    # Performance page
     # ------------------------------------------------------------------
 
     @app.callback(
@@ -1008,7 +991,7 @@ def _register_callbacks(
     )
     def update_performance_tab(n: int):  # noqa: ANN001
         db_path = cfg.database.db_path
-        _colors = ["#f5a623", "#4488ff", "#00e676", "#ff5252", "#aa44ff"]
+        _colors = ["#ff6b2b", "#4488ff", "#00c853", "#ff1744", "#aa44ff"]
 
         # Equity curve — all time, one line per strategy
         try:
@@ -1043,8 +1026,8 @@ def _register_callbacks(
                 y=drawdown.values,
                 mode="lines",
                 fill="tozeroy",
-                fillcolor="rgba(255,82,82,0.25)",
-                line=dict(color="#ff5252", width=1),
+                fillcolor="rgba(255,23,68,0.25)",
+                line=dict(color="#ff1744", width=1),
                 name="Drawdown",
             ))
             dd_fig.update_layout(_dark_layout(title="Drawdown"))
@@ -1064,7 +1047,7 @@ def _register_callbacks(
             summary_tbl: dbc.Table = dbc.Table([
                 _perf_thead,
                 html.Tbody([_empty_table_row("No trade data available", len(_perf_headers))]),
-            ], bordered=True, dark=True, hover=True, size="sm")
+            ], bordered=False, hover=True, size="sm")
             total_pnl_txt: object = "$0.00"
             sharpe_txt: object = "0.00"
             maxdd_txt: object = "$0.00"
@@ -1084,7 +1067,7 @@ def _register_callbacks(
                 ]))
             summary_tbl = dbc.Table([
                 _perf_thead, html.Tbody(rows),
-            ], bordered=True, dark=True, hover=True, size="sm")
+            ], bordered=False, hover=True, size="sm")
 
             total_pnl = float(perf_df["total_pnl"].sum())
             avg_sharpe = float(perf_df["sharpe"].mean())
@@ -1141,12 +1124,12 @@ def _register_callbacks(
             if not wins.empty:
                 hist_fig.add_trace(go.Histogram(
                     x=wins, name="Wins",
-                    marker_color="#00e676", opacity=0.7,
+                    marker_color="#00c853", opacity=0.7,
                 ))
             if not losses.empty:
                 hist_fig.add_trace(go.Histogram(
                     x=losses, name="Losses",
-                    marker_color="#ff5252", opacity=0.7,
+                    marker_color="#ff1744", opacity=0.7,
                 ))
             hist_fig.update_layout(_dark_layout(
                 title="Win / Loss Distribution",
@@ -1163,7 +1146,7 @@ def _register_callbacks(
         )
 
     # ------------------------------------------------------------------
-    # Health tab (shares perf-interval — 60 s is fine)
+    # Health page (shares perf-interval — 60 s is fine)
     # ------------------------------------------------------------------
 
     @app.callback(
@@ -1191,14 +1174,14 @@ def _register_callbacks(
             events_tbl: dbc.Table = dbc.Table([
                 evt_thead,
                 html.Tbody([_empty_table_row("No system events", len(evt_headers))]),
-            ], bordered=True, dark=True, size="sm")
+            ], bordered=False, size="sm")
         else:
             evt_rows = []
             for _, row in events_df.iterrows():
                 kind = str(row.get("kind", row.get("type", "")))
                 bg = (
-                    "rgba(255,82,82,0.15)" if kind == "ERROR"
-                    else ("rgba(245,166,35,0.15)" if kind == "WARNING" else "")
+                    "rgba(255,23,68,0.15)" if kind == "ERROR"
+                    else ("rgba(255,152,0,0.15)" if kind == "WARNING" else "")
                 )
                 evt_rows.append(html.Tr([
                     html.Td(str(row.get("timestamp", ""))),
@@ -1207,7 +1190,7 @@ def _register_callbacks(
                 ], style={"backgroundColor": bg} if bg else {}))
             events_tbl = dbc.Table([
                 evt_thead, html.Tbody(evt_rows),
-            ], bordered=True, dark=True, size="sm", responsive=True)
+            ], bordered=False, size="sm", responsive=True)
 
         # Signal frequency — fills grouped by date + strategy
         try:
@@ -1224,7 +1207,7 @@ def _register_callbacks(
                 .size()
                 .reset_index(name="count")
             )
-            _fc = ["#f5a623", "#4488ff", "#00e676", "#ff5252"]
+            _fc = ["#ff6b2b", "#4488ff", "#00c853", "#ff1744"]
             freq_fig = go.Figure()
             for i, (sid, grp) in enumerate(freq.groupby("strategy_id")):
                 freq_fig.add_trace(go.Bar(
@@ -1258,7 +1241,7 @@ def _register_callbacks(
             slip_fig = go.Figure(go.Bar(
                 x=avg_comm["strategy_id"],
                 y=avg_comm["commission"],
-                marker_color="#f5a623",
+                marker_color="#ff6b2b",
                 name="Avg Commission",
             ))
             slip_fig.update_layout(_dark_layout(
@@ -1282,6 +1265,502 @@ def _register_callbacks(
 # Public API
 # ---------------------------------------------------------------------------
 
+_INDEX_STRING = """<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* ============================================================
+   ALGOTRADE DASHBOARD — Vaulto-inspired Theme
+   ============================================================ */
+
+/* ── Design Tokens (Dark Mode — default) ─────────────────── */
+:root {
+  --bg-main:          #0e0e0e;
+  --bg-sidebar:       #141414;
+  --bg-card:          #1c1c1c;
+  --bg-card-hover:    #202020;
+  --bg-input:         #1a1a1a;
+  --bg-row-hover:     rgba(255,255,255,0.03);
+  --bg-nav-hover:     rgba(255,255,255,0.05);
+  --border-card:      rgba(255,255,255,0.05);
+  --border-input:     rgba(255,255,255,0.08);
+  --border-divider:   rgba(255,255,255,0.06);
+  --text-primary:     #f0f0f0;
+  --text-secondary:   #888888;
+  --text-table-header:#666666;
+  --text-muted:       #555555;
+  --accent-orange:    #ff6b2b;
+  --accent-green:     #00c853;
+  --accent-red:       #ff1744;
+  --accent-amber:     #ff9800;
+  --chart-line:       #ff6b2b;
+  --chart-grid:       rgba(255,255,255,0.04);
+  --card-accent-pnl-daily:  #ff6b2b;
+  --card-accent-drawdown:   #ff1744;
+  --card-accent-winrate:    rgba(255,255,255,0.15);
+  --card-accent-total-pnl:  #00c853;
+  --sidebar-width:    220px;
+  --sidebar-bg:       #141414;
+  --font-family:      'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --radius-sm:        6px;
+  --radius-md:        10px;
+  --radius-lg:        12px;
+  --radius-xl:        16px;
+  --radius-pill:      999px;
+  --shadow-card:      0 1px 3px rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.3);
+  --shadow-card-hover:0 4px 12px rgba(0,0,0,0.5);
+  --shadow-dropdown:  0 8px 24px rgba(0,0,0,0.6);
+  --transition-fast:  0.15s ease;
+  --transition-color: 0.2s ease;
+  /* legacy aliases kept for any remaining var() refs in inline styles */
+  --bg:               #0e0e0e;
+  --card:             #1c1c1c;
+  --card-border:      1px solid rgba(255,255,255,0.05);
+  --text:             #f0f0f0;
+  --text-muted-old:   #888888;
+  --grid-color:       rgba(255,255,255,0.04);
+  --table-alt:        rgba(255,255,255,0.02);
+  --table-text:       #f0f0f0;
+  --table-header-bg:  transparent;
+  --table-header-txt: #666666;
+  --modal-bg:         #1c1c1c;
+  --modal-border:     rgba(255,255,255,0.05);
+}
+
+/* ── Light Mode Overrides ─────────────────────────────────── */
+body.light-mode {
+  --bg-main:          #f5f5f5;
+  --bg-card:          #ffffff;
+  --bg-card-hover:    #fafafa;
+  --bg-input:         #f0f0f0;
+  --bg-row-hover:     rgba(0,0,0,0.02);
+  --bg-nav-hover:     rgba(0,0,0,0.04);
+  --border-card:      rgba(0,0,0,0.08);
+  --border-input:     rgba(0,0,0,0.1);
+  --border-divider:   rgba(0,0,0,0.06);
+  --text-primary:     #1a1a1a;
+  --text-secondary:   #6b7280;
+  --text-table-header:#9ca3af;
+  --text-muted:       #9ca3af;
+  --chart-grid:       rgba(0,0,0,0.04);
+  --shadow-card:      0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06);
+  --shadow-card-hover:0 4px 12px rgba(0,0,0,0.12);
+  --shadow-dropdown:  0 8px 24px rgba(0,0,0,0.15);
+  /* accents unchanged */
+  --accent-orange:    #ff6b2b;
+  --accent-green:     #00c853;
+  --accent-red:       #ff1744;
+  --accent-amber:     #ff9800;
+  /* sidebar always dark */
+  --sidebar-bg:       #141414;
+  /* legacy aliases */
+  --bg:               #f5f5f5;
+  --card:             #ffffff;
+  --card-border:      1px solid rgba(0,0,0,0.08);
+  --text:             #1a1a1a;
+  --grid-color:       rgba(0,0,0,0.04);
+  --table-alt:        rgba(0,0,0,0.02);
+  --table-text:       #1a1a1a;
+  --table-header-bg:  transparent;
+  --table-header-txt: #9ca3af;
+  --modal-bg:         #ffffff;
+  --modal-border:     rgba(0,0,0,0.08);
+}
+
+/* ── Base & Reset ─────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  font-family: var(--font-family);
+  background-color: var(--bg-main);
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+  min-height: 100vh;
+  transition: background-color var(--transition-color), color var(--transition-color);
+}
+
+/* ── Layout Shell ─────────────────────────────────────────── */
+.app-shell {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+  background-color: var(--bg-main);
+}
+
+.main-content {
+  flex: 1;
+  margin-left: var(--sidebar-width);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 32px;
+  background-color: var(--bg-main);
+  transition: background-color var(--transition-color);
+}
+
+.main-content::-webkit-scrollbar { width: 4px; }
+.main-content::-webkit-scrollbar-track { background: transparent; }
+.main-content::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.08);
+  border-radius: var(--radius-pill);
+}
+body.light-mode .main-content::-webkit-scrollbar-thumb {
+  background: rgba(0,0,0,0.12);
+}
+
+/* ── Sidebar ─────────────────────────────────────────────── */
+.sidebar, #sidebar {
+  position: fixed;
+  top: 0; left: 0;
+  width: var(--sidebar-width);
+  height: 100vh;
+  background-color: #141414 !important;
+  border-right: 1px solid rgba(255,255,255,0.05);
+  display: flex;
+  flex-direction: column;
+  padding: 24px 0;
+  z-index: 100;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+body.light-mode .sidebar,
+body.light-mode #sidebar {
+  background-color: #141414 !important;
+  border-right: 1px solid rgba(255,255,255,0.05);
+}
+.sidebar::-webkit-scrollbar { width: 0; }
+
+/* App name */
+.sidebar-app-name {
+  font-family: var(--font-family);
+  font-size: 18px;
+  font-weight: 700;
+  color: #ff6b2b;
+  letter-spacing: -0.01em;
+}
+
+/* Sidebar section label */
+.sidebar-section-label {
+  font-family: var(--font-family);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: #444444 !important;
+  padding: 0 16px;
+  margin-top: 16px;
+  margin-bottom: 4px;
+}
+
+/* Nav links */
+.nav-link, .sidebar-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  font-family: var(--font-family);
+  font-size: 14px;
+  font-weight: 500;
+  color: #888888;
+  border-left: 3px solid transparent;
+  cursor: pointer;
+  transition: background-color var(--transition-fast), color var(--transition-fast), border-left-color var(--transition-fast);
+  user-select: none;
+}
+.nav-link:hover, .sidebar-nav-item:hover {
+  background-color: rgba(255,255,255,0.05);
+  color: #cccccc;
+  text-decoration: none;
+}
+.nav-link.active, .sidebar-nav-item.active,
+.nav-link.active-nav, .sidebar-nav-item.active-nav {
+  color: #f0f0f0;
+  border-left-color: #ff6b2b;
+  background-color: rgba(255,107,43,0.06);
+}
+
+/* Nav hover override for ID-targeted links */
+#nav-overview:hover, #nav-performance:hover, #nav-health:hover {
+  background: rgba(255,255,255,0.05) !important;
+  color: #cccccc !important;
+}
+
+/* Sidebar divider */
+.sidebar-divider {
+  height: 1px;
+  background: rgba(255,255,255,0.05);
+  margin: 16px;
+}
+
+/* Sidebar bottom */
+.sidebar-bottom {
+  margin-top: auto;
+  padding: 16px;
+  border-top: 1px solid rgba(255,255,255,0.05);
+}
+
+/* Connection dot */
+.connection-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background-color: #00c853;
+  flex-shrink: 0;
+  box-shadow: 0 0 6px rgba(0,200,83,0.6);
+  animation: pulse-dot 2s ease-in-out infinite;
+  display: inline-block;
+}
+.connection-dot.disconnected {
+  background-color: #ff1744;
+  box-shadow: 0 0 6px rgba(255,23,68,0.6);
+  animation: none;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.6; transform: scale(0.9); }
+}
+/* legacy pulse for connection-dot-connected class */
+.connection-dot-connected { animation: pulse-dot 2s ease-in-out infinite; }
+
+/* Emergency stop button */
+.btn-emergency-stop, .kill-switch-btn {
+  width: 100% !important;
+  padding: 9px 16px !important;
+  background: transparent !important;
+  border: 1px solid #ff1744 !important;
+  border-radius: var(--radius-sm) !important;
+  color: #ff1744 !important;
+  font-family: var(--font-family) !important;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  text-transform: uppercase;
+  letter-spacing: 0.08em !important;
+  cursor: pointer;
+  transition: background-color var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast) !important;
+}
+.btn-emergency-stop:hover, .kill-switch-btn:hover {
+  background-color: #ff1744 !important;
+  color: #ffffff !important;
+  box-shadow: 0 0 12px rgba(255,23,68,0.35) !important;
+}
+.btn-emergency-stop:active, .kill-switch-btn:active {
+  background-color: #cc1336 !important;
+  transform: scale(0.98);
+}
+
+/* ── Page Header ──────────────────────────────────────────── */
+.page-title {
+  font-family: var(--font-family);
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+/* ── Stat Cards ───────────────────────────────────────────── */
+.stat-card {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg);
+  padding: 20px 24px;
+  position: relative;
+  overflow: hidden;
+  box-shadow: var(--shadow-card);
+  height: 100%;
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast), background-color var(--transition-color);
+}
+.stat-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0;
+  width: 3px; height: 100%;
+  background-color: var(--card-accent-color, rgba(255,255,255,0.15));
+  border-radius: 3px 0 0 3px;
+}
+.stat-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-card-hover); }
+
+.card-accent-orange::before { background-color: #ff6b2b !important; }
+.card-accent-red::before    { background-color: #ff1744 !important; }
+.card-accent-green::before  { background-color: #00c853 !important; }
+.card-accent-muted::before  { background-color: rgba(255,255,255,0.15) !important; }
+
+.stat-card-label, .card-label {
+  font-family: var(--font-family);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  line-height: 1;
+}
+.stat-card-value, .card-value {
+  font-family: var(--font-family);
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+  line-height: 1;
+  margin-bottom: 8px;
+}
+.stat-card-value.positive, .value-positive { color: #00c853; }
+.stat-card-value.negative, .value-negative { color: #ff1744; }
+.stat-card-value.warning                   { color: #ff9800; }
+
+/* ── Generic Card ─────────────────────────────────────────── */
+.card, .dbc-card {
+  background-color: var(--bg-card) !important;
+  border: 1px solid var(--border-card) !important;
+  border-radius: var(--radius-lg) !important;
+  box-shadow: var(--shadow-card) !important;
+  color: var(--text-primary) !important;
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast), background-color var(--transition-color);
+}
+.card:hover { transform: translateY(-2px); box-shadow: var(--shadow-card-hover) !important; }
+.card-body  { padding: 20px 24px !important; }
+
+/* ── Chart Card ───────────────────────────────────────────── */
+.chart-card {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg);
+  padding: 8px;
+  box-shadow: var(--shadow-card);
+  transition: transform var(--transition-fast), background-color var(--transition-color);
+}
+.chart-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-card-hover); }
+
+.js-plotly-plot, .plotly, .dash-graph { background: transparent !important; }
+.js-plotly-plot .plotly .main-svg     { background: transparent !important; }
+
+/* ── Tables ───────────────────────────────────────────────── */
+.table {
+  color: var(--text-primary) !important;
+  margin-bottom: 0;
+  font-family: var(--font-family);
+}
+.table thead th {
+  font-family: var(--font-family) !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.1em !important;
+  color: var(--text-table-header) !important;
+  padding: 8px 16px !important;
+  border-bottom: 1px solid var(--border-divider) !important;
+  border-top: none !important;
+  background: transparent !important;
+}
+.table td, .table th {
+  border-color: var(--border-divider) !important;
+  border-top: none !important;
+  border-bottom: none !important;
+}
+.table tbody tr { height: 48px; transition: background-color var(--transition-fast); }
+.table tbody tr:hover td { background-color: var(--bg-row-hover) !important; }
+.table tbody td { font-size: 14px; color: var(--text-primary) !important; }
+.table-dark, .table-dark td, .table-dark th, .table-dark thead th {
+  background-color: transparent !important;
+  color: var(--text-primary) !important;
+  border-color: var(--border-divider) !important;
+}
+
+/* ── Strategy Card ────────────────────────────────────────── */
+.strategy-card {
+  background-color: var(--bg-card) !important;
+  border: 1px solid var(--border-card) !important;
+  border-radius: var(--radius-lg) !important;
+  box-shadow: var(--shadow-card) !important;
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+.strategy-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-card-hover) !important; }
+
+/* ── Badges ───────────────────────────────────────────────── */
+.badge { font-family: var(--font-family) !important; font-size: 11px !important; font-weight: 600 !important; letter-spacing: 0.04em; padding: 3px 8px !important; border-radius: var(--radius-pill) !important; }
+.badge.bg-success { background-color: rgba(0,200,83,0.12) !important; color: #00c853 !important; border: 1px solid #00c853 !important; }
+.badge.bg-danger  { background-color: rgba(255,23,68,0.12) !important;  color: #ff1744 !important; border: 1px solid #ff1744 !important; }
+.badge.bg-warning { background-color: rgba(255,152,0,0.12) !important;  color: #ff9800 !important; }
+.badge.bg-primary { background-color: rgba(255,107,43,0.12) !important; color: #ff6b2b !important; }
+
+/* ── Buttons ──────────────────────────────────────────────── */
+.btn, button { font-family: var(--font-family) !important; cursor: pointer; border-radius: var(--radius-sm) !important; font-weight: 500 !important; transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast) !important; }
+.btn-warning  { background: #ff6b2b !important; color: #fff !important; border: none !important; border-radius: 8px !important; font-weight: 600 !important; }
+.btn-success:not(.kill-switch-btn):not(.btn-emergency-stop) { background: #ff6b2b !important; color: #fff !important; border: none !important; border-radius: 8px !important; font-weight: 600 !important; }
+.btn-secondary { background: rgba(255,255,255,0.06) !important; color: var(--text-secondary) !important; border: 1px solid var(--border-card) !important; border-radius: 8px !important; }
+.btn-secondary:hover { background: rgba(255,255,255,0.1) !important; color: var(--text-primary) !important; }
+
+/* ── Form & Switch ────────────────────────────────────────── */
+.form-check-input:checked { background-color: #ff6b2b !important; border-color: #ff6b2b !important; }
+.form-switch .form-check-input { cursor: pointer; }
+
+/* ── Modal ────────────────────────────────────────────────── */
+.modal-content { background-color: var(--bg-card) !important; border: 1px solid var(--border-card) !important; border-radius: var(--radius-xl) !important; box-shadow: var(--shadow-dropdown) !important; color: var(--text-primary) !important; }
+.modal-header  { border-bottom: 1px solid var(--border-divider) !important; padding: 20px !important; }
+.modal-title   { font-size: 16px !important; font-weight: 600 !important; color: var(--text-primary) !important; }
+.modal-body    { padding: 20px !important; }
+.modal-footer  { border-top: 1px solid var(--border-divider) !important; padding: 12px 20px !important; }
+.btn-close     { filter: invert(1) opacity(0.5) !important; }
+.btn-close:hover { filter: invert(1) opacity(1) !important; }
+
+/* ── Section title ────────────────────────────────────────── */
+.section-title {
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+}
+
+/* ── Alerts ───────────────────────────────────────────────── */
+.alert-secondary { background-color: var(--bg-card) !important; border-color: var(--border-card) !important; color: var(--text-secondary) !important; }
+
+/* ── Misc ─────────────────────────────────────────────────── */
+.navbar, nav.navbar { display: none !important; }
+hr { border-color: rgba(255,255,255,0.06) !important; }
+.container-fluid, .container { background-color: transparent !important; }
+.page-content { padding: 0 0 32px 0; }
+
+/* ── Light mode card overrides ────────────────────────────── */
+body.light-mode .card, body.light-mode .stat-card,
+body.light-mode .chart-card, body.light-mode .strategy-card {
+  background-color: #ffffff !important;
+  border-color: rgba(0,0,0,0.08) !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.07), 0 1px 2px rgba(0,0,0,0.05) !important;
+}
+body.light-mode .table, body.light-mode .table tbody td,
+body.light-mode .table-dark, body.light-mode .table-dark td,
+body.light-mode .table-dark th, body.light-mode .table-dark thead th {
+  color: #1a1a1a !important;
+}
+body.light-mode .modal-content { background-color: #ffffff !important; border-color: rgba(0,0,0,0.08) !important; }
+body.light-mode hr { border-color: rgba(0,0,0,0.06) !important; }
+        </style>
+    </head>
+    <body class="dark-mode">
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>"""
+
+
 def create_app(eng, cfg: AppConfig) -> dash.Dash:
     """
     Construct and return the configured Dash application.
@@ -1293,226 +1772,194 @@ def create_app(eng, cfg: AppConfig) -> dash.Dash:
     engine = eng
     config = cfg
 
-    # Collect all registered strategy IDs at startup time so callback
-    # inputs are static (required by Dash).
     strategy_ids: list[str] = []
     if eng is not None and hasattr(eng, "_strategies"):
         strategy_ids = [s.strategy_id for s in eng._strategies]
 
-    # Determine paper vs live mode label for header subtitle
     _is_paper = True
     if cfg is not None:
         _is_paper = getattr(cfg, "paper_trading", True)
     _mode_label = "Paper Trading" if _is_paper else "Live Trading"
-    _mode_color = "#00e676" if _is_paper else "#ff5252"
+    _mode_color = "#00c853" if _is_paper else "#ff1744"
 
     app = dash.Dash(
         __name__,
-        external_stylesheets=[dbc.themes.SLATE],
+        external_stylesheets=[dbc.themes.BOOTSTRAP],
         suppress_callback_exceptions=True,
         title="AlgoTrade",
     )
 
-    app.index_string = """<!DOCTYPE html>
-<html>
-    <head>
-        {%metas%}
-        <title>{%title%}</title>
-        {%favicon%}
-        {%css%}
-        <style>
-            body {
-                background-color: #0d0d0d !important;
-                color: #e8e8f0 !important;
-            }
-            .dash-graph, .js-plotly-plot, .plotly {
-                background: transparent !important;
-            }
+    app.index_string = _INDEX_STRING
 
-            /* Tab bar */
-            .nav-tabs {
-                background-color: #0d0d0d;
-                border-bottom: 1px solid #2a2a3a;
-            }
-            .nav-tabs .nav-link {
-                color: #6b7280 !important;
-                border: none !important;
-                border-bottom: 2px solid transparent !important;
-                background: transparent !important;
-                padding: 10px 18px;
-            }
-            .nav-tabs .nav-link.active {
-                color: #f5a623 !important;
-                border-bottom: 2px solid #f5a623 !important;
-                background: transparent !important;
-            }
-            .nav-tabs .nav-link:hover {
-                color: #e8e8f0 !important;
-                border-bottom: 2px solid #2a2a3a !important;
-            }
+    # ── Sidebar ────────────────────────────────────────────────────────
+    sidebar = html.Div(
+        id="sidebar",
+        className="sidebar",
+        children=[
+            # Logo + mode badge
+            html.Div([
+                html.Div("AlgoTrade", className="sidebar-app-name", style={
+                    "color": "#ff6b2b", "fontWeight": "700",
+                }),
+                html.Div(_mode_label, style={
+                    "fontSize": "11px", "color": _mode_color,
+                    "marginTop": "4px", "fontWeight": "600",
+                    "letterSpacing": "0.04em", "textTransform": "uppercase",
+                }),
+            ], style={"padding": "28px 20px 20px"}),
 
-            /* Navbar */
-            .navbar, nav.navbar {
-                background-color: #0d0d0d !important;
-                border-bottom: 1px solid #2a2a3a !important;
-            }
+            # Divider
+            html.Hr(style={"margin": "0 16px 4px", "borderColor": "rgba(255,255,255,0.1)"}),
 
-            /* Emergency stop hover */
-            .kill-switch-btn:hover {
-                background: #ff5252 !important;
-                color: #fff !important;
-            }
+            # Nav links — initial style set here; callback updates on click
+            html.Nav([
+                html.Div("Overview", id="nav-overview", n_clicks=0, style={
+                    "background": "#2d2d3d", "color": "#ffffff",
+                    "borderRadius": "8px", "padding": "10px 16px",
+                    "cursor": "pointer", "fontSize": "14px", "fontWeight": "600",
+                    "marginBottom": "4px", "userSelect": "none",
+                }),
+                html.Div("Performance", id="nav-performance", n_clicks=0, style={
+                    "background": "transparent", "color": "#9ca3af",
+                    "borderRadius": "8px", "padding": "10px 16px",
+                    "cursor": "pointer", "fontSize": "14px",
+                    "marginBottom": "4px", "userSelect": "none",
+                }),
+                html.Div("Health", id="nav-health", n_clicks=0, style={
+                    "background": "transparent", "color": "#9ca3af",
+                    "borderRadius": "8px", "padding": "10px 16px",
+                    "cursor": "pointer", "fontSize": "14px",
+                    "marginBottom": "4px", "userSelect": "none",
+                }),
+            ], style={"padding": "12px 12px", "flex": "1"}),
 
-            /* Pulse animation for connected dot */
-            @keyframes pulse {
-                0%   { opacity: 1; }
-                50%  { opacity: 0.35; }
-                100% { opacity: 1; }
-            }
-            .connection-dot-connected {
-                animation: pulse 2s ease-in-out infinite;
-            }
+            # Bottom: status + kill switch
+            html.Div([
+                html.Hr(style={"margin": "0 0 14px", "borderColor": "rgba(255,255,255,0.1)"}),
 
-            /* Tables */
-            .table {
-                color: #e8e8f0 !important;
-            }
-            .table thead th {
-                background-color: #13131d !important;
-                color: #6b7280 !important;
-                font-size: 11px !important;
-                text-transform: uppercase !important;
-                letter-spacing: 0.06em !important;
-                border-bottom: 1px solid #2a2a3a !important;
-                border-top: none !important;
-            }
-            .table td, .table th {
-                border-color: #2a2a3a !important;
-            }
-            .table-dark {
-                background-color: transparent !important;
-            }
-            .table-dark td, .table-dark th, .table-dark thead th {
-                border-color: #2a2a3a !important;
-            }
-            .table tbody tr:nth-child(even) td {
-                background-color: #1e1e2a !important;
-            }
-            .table-hover tbody tr:hover td {
-                background-color: rgba(245,166,35,0.06) !important;
-            }
+                # Connection status
+                html.Div(id="status-connection",
+                         children=html.Span("⬤ Unknown",
+                                            style={"color": "rgba(255,255,255,0.4)"}),
+                         style={"fontSize": "13px", "marginBottom": "8px"}),
 
-            /* Modal */
-            .modal-content {
-                background-color: #1a1a24 !important;
-                border: 1px solid #2a2a3a !important;
-                color: #e8e8f0 !important;
-            }
-            .modal-header {
-                border-bottom: 1px solid #2a2a3a !important;
-            }
-            .modal-footer {
-                border-top: 1px solid #2a2a3a !important;
-            }
-            .modal-title {
-                color: #e8e8f0 !important;
-            }
+                # Kill-switch status + resume
+                html.Div([
+                    html.Div(id="status-halted",
+                             children=html.Span("Active", style={"color": "#00c853"}),
+                             style={"fontSize": "13px", "marginBottom": "6px"}),
+                    dbc.Button(
+                        "Resume",
+                        id="resume-btn",
+                        size="sm",
+                        n_clicks=0,
+                        style={
+                            "display": "none",
+                            "background": "#f5a623", "color": "#000",
+                            "border": "none", "borderRadius": "8px",
+                            "fontWeight": "600", "padding": "4px 14px",
+                            "fontSize": "12px", "marginBottom": "8px",
+                        },
+                    ),
+                ]),
 
-            /* Cards global fallback */
-            .card {
-                background-color: #1a1a24 !important;
-                border: 1px solid #2a2a3a !important;
-            }
+                html.Hr(style={"margin": "10px 0", "borderColor": "rgba(255,255,255,0.1)"}),
 
-            /* Alerts */
-            .alert-secondary {
-                background-color: #1a1a24 !important;
-                border-color: #2a2a3a !important;
-                color: #6b7280 !important;
-            }
+                # Emergency stop
+                dbc.Button(
+                    [html.Span("■ ", style={"color": "#ff1744", "marginRight": "6px"}),
+                     "EMERGENCY STOP"],
+                    id="kill-switch-btn",
+                    className="kill-switch-btn btn-emergency-stop",
+                    n_clicks=0,
+                ),
+                dbc.Modal([
+                    dbc.ModalHeader(dbc.ModalTitle("Confirm Emergency Stop")),
+                    dbc.ModalBody(
+                        "This will immediately halt all trading and cancel all open orders. "
+                        "Are you sure?"
+                    ),
+                    dbc.ModalFooter([
+                        dbc.Button("Cancel", id="kill-switch-cancel",
+                                   color="secondary", className="me-2", n_clicks=0),
+                        dbc.Button("CONFIRM STOP", id="kill-switch-confirm",
+                                   color="danger", n_clicks=0),
+                    ]),
+                ], id="kill-switch-modal", is_open=False),
 
-            /* Container background */
-            .container-fluid, .container {
-                background-color: transparent !important;
-            }
+            ], className="sidebar-bottom", style={"padding": "0 16px 24px", "marginTop": "auto"}),
+        ],
+        style={
+            "width": "220px",
+            "minHeight": "100vh",
+            "background": "#1a1a2e",
+            "display": "flex",
+            "flexDirection": "column",
+            "position": "fixed",
+            "left": "0",
+            "top": "0",
+            "bottom": "0",
+            "zIndex": "1000",
+            "overflowY": "auto",
+        },
+    )
 
-            /* Badge pill overrides (for callback-driven color updates) */
-            .badge.bg-success {
-                background-color: rgba(0,230,118,0.2) !important;
-                color: #00e676 !important;
-                border: 1px solid #00e676 !important;
-                border-radius: 99px !important;
-            }
-            .badge.bg-danger {
-                background-color: rgba(255,82,82,0.2) !important;
-                color: #ff5252 !important;
-                border: 1px solid #ff5252 !important;
-                border-radius: 99px !important;
-            }
+    # ── Main content ───────────────────────────────────────────────────
+    main_content = html.Div(
+        id="main-content",
+        className="main-content",
+        children=[
+            # Top header bar
+            html.Div([
+                html.H5(id="page-header-title", children="Overview",
+                        className="page-title", style={"margin": "0"}),
+                # Theme toggle (right side)
+                html.Div([
+                    html.Span("Light", style={
+                        "fontSize": "12px", "color": "var(--text-muted)",
+                        "marginRight": "8px", "userSelect": "none",
+                    }),
+                    dbc.Switch(id="theme-toggle", value=False,
+                               style={"display": "inline-block", "cursor": "pointer"}),
+                    html.Span("Dark", style={
+                        "fontSize": "12px", "color": "var(--text-muted)",
+                        "marginLeft": "8px", "userSelect": "none",
+                    }),
+                ], style={"display": "flex", "alignItems": "center"}),
+            ], style={
+                "display": "flex",
+                "alignItems": "center",
+                "justifyContent": "space-between",
+                "padding": "20px 24px 8px",
+                "borderBottom": "1px solid var(--card-border)",
+                "marginBottom": "0",
+                "background": "var(--bg)",
+                "position": "sticky",
+                "top": "0",
+                "zIndex": "100",
+            }),
 
-            /* Button color overrides for callback-driven updates */
-            .btn-warning {
-                background: #f5a623 !important;
-                color: #000 !important;
-                border: none !important;
-                border-radius: 8px !important;
-                font-weight: 600 !important;
-            }
-            .btn-success:not(.kill-switch-btn) {
-                background: #f5a623 !important;
-                color: #000 !important;
-                border: none !important;
-                border-radius: 8px !important;
-                font-weight: 600 !important;
-            }
-            .btn-secondary {
-                background: #2a2a3a !important;
-                color: #e8e8f0 !important;
-                border: 1px solid #3a3a4a !important;
-                border-radius: 8px !important;
-            }
-        </style>
-    </head>
-    <body>
-        {%app_entry%}
-        <footer>
-            {%config%}
-            {%scripts%}
-            {%renderer%}
-        </footer>
-    </body>
-</html>"""
+            # Page containers (all always in DOM; display toggled by callback)
+            html.Div([
+                _overview_page(strategy_ids),
+                _performance_page(),
+                _health_page(),
+            ], style={"padding": "0 24px"}),
+        ],
+        style={
+            "marginLeft": "220px",
+            "minHeight": "100vh",
+            "background": "var(--bg-main)",
+        },
+    )
 
     app.layout = html.Div([
-        html.Div([
-            dbc.Container([
-                dbc.Row([
-                    dbc.Col([
-                        html.Span("AlgoTrade Dashboard", style={
-                            "fontSize": "20px", "fontWeight": "500",
-                            "color": "#e8e8f0", "letterSpacing": "0.02em",
-                        }),
-                        html.Span(
-                            f"  {_mode_label}",
-                            style={"fontSize": "12px", "color": _mode_color,
-                                   "marginLeft": "12px", "fontWeight": "500"},
-                        ),
-                    ]),
-                ], align="center", className="py-3"),
-            ], fluid=True),
-        ], style={
-            "backgroundColor": "#0d0d0d",
-            "borderBottom": "1px solid #2a2a3a",
-            "marginBottom": "0",
-        }),
-        dbc.Container([
-            dbc.Tabs(
-                [_live_tab(strategy_ids), _performance_tab(), _health_tab()],
-                id="main-tabs",
-                active_tab="tab-live",
-            ),
-        ], fluid=True),
-    ], style={"backgroundColor": "#0d0d0d", "minHeight": "100vh"})
+        dcc.Store(id="theme-store", data="dark"),
+        dcc.Store(id="current-page", data="overview"),
+        html.Div(id="theme-applier", style={"display": "none"}),
+        sidebar,
+        main_content,
+    ], className="app-shell")
 
     _register_callbacks(app, cfg, strategy_ids)
     return app
@@ -1540,38 +1987,9 @@ def run_dashboard(eng, cfg: AppConfig) -> None:
 #   Set by create_app(); read by all callbacks via closure.
 #
 # create_app(eng: TradingEngine, cfg: AppConfig) -> dash.Dash
-#   Build the three-tab Dash application.
+#   Build the sidebar-navigation Dash application.
 #   Sets module-level engine + config, wires layout and callbacks.
 #   Returns the Dash instance; caller must call app.run() to serve.
 #
 # run_dashboard(eng: TradingEngine, cfg: AppConfig) -> None
 #   Convenience wrapper: create_app() then app.run() with config host/port.
-#   Intended to run in a daemon thread alongside TradingEngine.run().
-#
-# Tabs
-# ----
-# tab-live        id="tab-live"        — live-interval (5 s)
-# tab-performance id="tab-performance" — perf-interval (60 s)
-# tab-health      id="tab-health"      — perf-interval (60 s)
-#
-# Key callback outputs
-# --------------------
-# live-equity-chart       go.Figure  today's cumulative PnL line
-# status-daily-pnl        html       coloured dollar amount
-# status-drawdown         html       coloured percentage
-# status-connection       html       coloured dot + label
-# status-halted           html       Active / HALTED text
-# resume-btn style        dict       shown only when is_halted
-# positions-table         dbc.Table  open positions from shared_state
-# fills-table             dbc.Table  today's fills from DB
-# strategy-controls       list       one card per strategy with toggle
-# perf-equity-chart       go.Figure  all-time equity per strategy
-# perf-drawdown-chart     go.Figure  drawdown filled area
-# perf-summary-table      dbc.Table  one row per strategy
-# monthly-heatmap         go.Figure  RdYlGn heatmap
-# pnl-histogram           go.Figure  wins (green) + losses (red)
-# system-events-table     dbc.Table  ERROR=red, WARNING=amber rows
-# signal-freq-chart       go.Figure  stacked bars by day/strategy
-# slippage-chart          go.Figure  avg commission per strategy
-# macro-regime-panel      html.Div   regime cards (read-only)
-# upcoming-events-table   dbc.Table  impact-coloured rows
