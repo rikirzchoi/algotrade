@@ -1,0 +1,109 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --font-geist-sans: 'Inter', system-ui, sans-serif;
+    --font-geist-mono: ui-monospace, 'Cascadia Code', monospace;
+  }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-background text-zinc-100 font-sans;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: #3f3f46;
+    border-radius: 99px;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface border border-border rounded-xl;
+  }
+
+  .stat-accent-left {
+    position: relative;
+    overflow: hidden;
+  }
+  .stat-accent-left::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0;
+    width: 3px; height: 100%;
+    border-radius: 3px 0 0 3px;
+  }
+  .stat-accent-orange::before { background: #f97316; }
+  .stat-accent-red::before    { background: #ef4444; }
+  .stat-accent-green::before  { background: #22c55e; }
+  .stat-accent-zinc::before   { background: #52525b; }
+
+  /* TradingView chart container */
+  .tv-chart {
+    @apply w-full rounded-lg overflow-hidden;
+  }
+
+  /* Table */
+  .data-table {
+    @apply w-full text-sm;
+  }
+  .data-table thead tr {
+    @apply border-b border-border;
+  }
+  .data-table thead th {
+    @apply py-2 px-3 text-left text-[11px] font-medium uppercase tracking-widest text-muted;
+  }
+  .data-table tbody tr {
+    @apply border-b border-border/40 transition-colors;
+  }
+  .data-table tbody tr:last-child {
+    @apply border-0;
+  }
+  .data-table tbody tr:hover {
+    @apply bg-zinc-800/30;
+  }
+  .data-table tbody td {
+    @apply py-3 px-3 text-zinc-300;
+  }
+
+  /* Nav item */
+  .nav-item {
+    @apply flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium
+           text-muted transition-all cursor-pointer select-none;
+  }
+  .nav-item:hover {
+    @apply bg-zinc-800/60 text-zinc-300;
+  }
+  .nav-item.active {
+    @apply bg-zinc-800 text-zinc-100 border-l-2 border-accent;
+    padding-left: calc(0.75rem - 2px);
+  }
+
+  /* Badge */
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold;
+  }
+  .badge-green  { @apply bg-positive/10 text-positive border border-positive/30; }
+  .badge-red    { @apply bg-negative/10 text-negative border border-negative/30; }
+  .badge-orange { @apply bg-accent/10   text-accent   border border-accent/30;   }
+  .badge-zinc   { @apply bg-zinc-700/40 text-muted    border border-border;       }
+}

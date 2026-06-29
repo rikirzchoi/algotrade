@@ -6,19 +6,24 @@ a BarEvent, and dispatches it through the same strategy.on_bar() pipeline used
 in live trading.  This ensures backtested results reflect the same logic and
 risk rules that run in production.
 
-Fill simulation
----------------
-Entries receive the signal's pending-levels entry price with a configurable
-slippage (default: 0.05 %).  Exits at target/stop are assumed to fill at the
-exact level (no additional slippage — conservative assumption).
-Commission is modelled as a flat per-share amount (default: $0.005 IBKR rate).
+Fill simulation (deliberately conservative)
+-------------------------------------------
+- Entries fill at the signal's entry price plus slippage (default 0.05 %).
+- When a single bar's range spans BOTH the stop and the target, the stop is
+  assumed to hit first (worst case) — no optimistic "target first" bias.
+- Stop / flatten / end-of-data exits are market-style and take adverse
+  slippage; target exits are resting limit orders and fill at the limit.
+- Position sizing uses the SAME path as live (RiskManager.size_position:
+  fixed-fractional core + macro overlay), so sizes match production.
+- Commission is a flat per-share amount (default $0.005, IBKR rate).
 
 Limitations
 -----------
 - No partial fills
-- No intraday liquidity modelling
-- Assumes fills occur at the simulated price with 100 % certainty
-- Single symbol per engine instance (multi-symbol not yet supported)
+- No intraday liquidity / market-impact modelling
+- No short-borrow cost
+- Macro overlay uses the CURRENT regime across all history (no historical series)
+- Single symbol per engine instance (portfolio backtest not yet supported)
 """
 
 from __future__ import annotations
@@ -35,7 +40,9 @@ import pytz
 
 from config import AppConfig
 from core.events import BarEvent, Direction, FillEvent, SignalEvent
-from risk.sizing import fixed_fractional
+from backtesting.costs import CostModel
+from backtesting.data_loader import parse_ohlcv_csv
+from risk.manager import RiskManager
 from strategies.base import BaseStrategy
 
 _ET = pytz.timezone("America/New_York")
@@ -58,6 +65,7 @@ class BacktestTrade:
     exit_reason: str          # "target" | "stop" | "flatten" | "end_of_data"
     stop_price: float = 0.0   # used by engine to check bar lows/highs
     target_price: float = 0.0
+    borrow_cost: float = 0.0  # short-borrow financing charge (shorts only)
 
 
 @dataclass
@@ -94,6 +102,10 @@ class BacktestEngine:
         self._bars: list[BarEvent] = []
         self._logger = logging.getLogger("backtest.engine")
 
+        # Same sizing path as live (fixed-fractional core + macro overlay), so
+        # backtested position sizes match what the live engine would trade.
+        self._risk = RiskManager(config)
+
         # Simulated account state
         self._equity: float = config.risk.capital
         self._open_trades: dict[str, BacktestTrade] = {}   # symbol → open trade
@@ -102,145 +114,20 @@ class BacktestEngine:
         self._signals_generated: int = 0
         self._signals_taken: int = 0
 
-        # Commission / slippage model
-        self._commission_per_share: float = 0.005   # IBKR typical
-        self._slippage_pct: float = 0.0005          # 0.05 %
+        # Shared, conservative cost model (also used by the portfolio engine).
+        self._costs = CostModel()
 
     # ------------------------------------------------------------------
     # Data loading
     # ------------------------------------------------------------------
 
     def load_csv(self, csv_path: str | Path, symbol: Optional[str] = None) -> None:
-        """
-        Load historical OHLCV data from *csv_path*.
-
-        Accepts both lowercase (timestamp/open/…) and Yahoo Finance-style
-        (Date/Open/…) column names, as well as the yfinance multi-level header
-        format where the first two rows are field names and ticker names::
-
-            Price,Close,High,Low,Open,Volume
-            Ticker,SPY,SPY,SPY,SPY,SPY
-            2024-01-02,...
-
-        Date-only timestamps are assigned a close-of-day time of 16:00:00 ET.
-        Bar size is inferred from the median interval between consecutive bars.
-        """
-        csv_path = Path(csv_path)
-
-        if symbol is None:
-            symbol = csv_path.stem.upper()
-
-        # Peek at the first few rows to detect format and retain for error reporting
-        raw_peek = pd.read_csv(csv_path, header=None, nrows=5)
-
-        # Detect yfinance multi-level format: the second row (index 1) contains
-        # non-numeric ticker symbols rather than data values.
-        is_yfinance = False
-        if len(raw_peek) >= 2:
-            second_row_val = str(raw_peek.iloc[1, 1])
-            try:
-                float(second_row_val)
-            except ValueError:
-                is_yfinance = True
-
-        if is_yfinance:
-            # Row 0 supplies field names (Price/Close/High/Low/Open/Volume);
-            # row 1 supplies ticker names — both rows are skipped as data.
-            col_names = list(raw_peek.iloc[0])
-            df = pd.read_csv(csv_path, skiprows=2, names=col_names)
-            # First column (labelled "Price") holds dates → rename to "timestamp"
-            rename: dict[str, str] = {col_names[0]: "timestamp"}
-            for col in col_names[1:]:
-                rename[col] = col.lower()
-            df = df.rename(columns=rename)
-        else:
-            df = pd.read_csv(csv_path)
-            # Normalise column names to lowercase variants
-            col_lower = {c.lower(): c for c in df.columns}
-            rename = {}
-            for target, candidates in [
-                ("timestamp", ["timestamp", "date", "datetime", "time"]),
-                ("open",      ["open"]),
-                ("high",      ["high"]),
-                ("low",       ["low"]),
-                ("close",     ["close", "adj close"]),
-                ("volume",    ["volume"]),
-            ]:
-                for cand in candidates:
-                    if cand in col_lower:
-                        rename[col_lower[cand]] = target
-                        break
-            df = df.rename(columns=rename)
-
-        raw: list[tuple[datetime, float, float, float, float, int]] = []
-        for _, row in df.iterrows():
-            try:
-                ts = pd.to_datetime(str(row["timestamp"]))
-            except Exception:
-                continue
-
-            # Date-only → close of day 16:00 ET
-            if ts.hour == 0 and ts.minute == 0 and ts.second == 0:
-                ts = ts.replace(hour=16, minute=0, second=0)
-
-            if ts.tzinfo is None:
-                ts = _ET.localize(ts)
-            else:
-                ts = ts.astimezone(_ET)
-
-            raw.append((
-                ts.to_pydatetime(),
-                float(row["open"]),
-                float(row["high"]),
-                float(row["low"]),
-                float(row["close"]),
-                int(float(row.get("volume", 0))),
-            ))
-
-        raw.sort(key=lambda x: x[0])
-
-        # Infer bar size from median interval between consecutive rows
-        bar_size = "1 day"
-        if len(raw) >= 2:
-            deltas = [
-                (raw[i + 1][0] - raw[i][0]).total_seconds()
-                for i in range(min(len(raw) - 1, 20))
-            ]
-            median_secs = sorted(deltas)[len(deltas) // 2]
-            if median_secs <= 120:
-                bar_size = "1 min"
-            elif median_secs <= 1_000:
-                bar_size = "15 mins"
-            else:
-                bar_size = "1 day"
-
-        self._bars = [
-            BarEvent(
-                symbol=symbol,
-                timestamp=r[0],
-                open=Decimal(str(r[1])),
-                high=Decimal(str(r[2])),
-                low=Decimal(str(r[3])),
-                close=Decimal(str(r[4])),
-                volume=r[5],
-                bar_size=bar_size,
-                vwap=Decimal(str(r[4])),   # close as VWAP approximation
-            )
-            for r in raw
-        ]
-
-        if not self._bars:
-            preview = raw_peek.to_string(index=False)
-            raise ValueError(
-                f"load_csv loaded 0 bars from {csv_path}. "
-                f"Check that the file contains valid OHLCV data.\n"
-                f"First few raw rows:\n{preview}"
-            )
-
+        """Load historical OHLCV data from *csv_path* (see data_loader)."""
+        self._bars = parse_ohlcv_csv(csv_path, symbol)
         self._logger.info(
             "Loaded %d bars for %s from %s to %s",
             len(self._bars),
-            symbol,
+            self._bars[0].symbol,
             self._bars[0].timestamp,
             self._bars[-1].timestamp,
         )
@@ -275,20 +162,34 @@ class BacktestEngine:
                 bar_high = float(bar.high)
                 bar_low = float(bar.low)
 
+                # Stop is checked BEFORE target: when a single bar's range spans
+                # both levels we cannot know the intrabar path, so we assume the
+                # worse outcome (stop hit first). This avoids the optimistic bias
+                # of booking the win whenever a bar straddles both.
                 if trade.direction == Direction.LONG:
-                    if bar_high >= trade.target_price:
-                        self._close_trade(trade, trade.target_price, bar.timestamp, "target")
-                    elif bar_low <= trade.stop_price:
+                    if bar_low <= trade.stop_price:
                         self._close_trade(trade, trade.stop_price, bar.timestamp, "stop")
+                    elif bar_high >= trade.target_price:
+                        self._close_trade(trade, trade.target_price, bar.timestamp, "target")
                 elif trade.direction == Direction.SHORT:
-                    if bar_low <= trade.target_price:
-                        self._close_trade(trade, trade.target_price, bar.timestamp, "target")
-                    elif bar_high >= trade.stop_price:
+                    if bar_high >= trade.stop_price:
                         self._close_trade(trade, trade.stop_price, bar.timestamp, "stop")
+                    elif bar_low <= trade.target_price:
+                        self._close_trade(trade, trade.target_price, bar.timestamp, "target")
 
             # -- Step 2: call strategy and snapshot equity ---------------
             signal = self._strategy.on_bar(bar)
-            self._equity_curve.append((bar.timestamp, self._equity))
+            # Mark-to-market: realised equity + unrealised P&L of any open
+            # position at this bar's close, so drawdown sees open-position dips.
+            mtm = self._equity
+            open_trade = self._open_trades.get(symbol)
+            if open_trade is not None:
+                px = float(bar.close)
+                if open_trade.direction == Direction.LONG:
+                    mtm += (px - open_trade.entry_price) * open_trade.quantity
+                else:
+                    mtm += (open_trade.entry_price - px) * open_trade.quantity
+            self._equity_curve.append((bar.timestamp, mtm))
 
             # -- Step 3: process the signal ------------------------------
             if signal is None:
@@ -315,22 +216,13 @@ class BacktestEngine:
             if levels is None:
                 continue
 
-            qty = fixed_fractional(
-                self._equity,
-                self._config.risk.risk_per_trade_pct,
-                levels["entry"],
-                levels["stop"],
-                self._config.risk.max_position_size,
-            )
+            qty = self._risk.size_position(signal, levels["entry"], levels["stop"])
             if qty == 0:
                 continue
 
-            if signal.direction == Direction.LONG:
-                fill_price = levels["entry"] * (1 + self._slippage_pct)
-            else:
-                fill_price = levels["entry"] * (1 - self._slippage_pct)
+            fill_price = self._costs.entry_fill_price(levels["entry"], signal.direction)
 
-            entry_commission = qty * self._commission_per_share
+            entry_commission = self._costs.commission(qty)
             self._equity -= entry_commission
 
             trade = BacktestTrade(
@@ -404,19 +296,30 @@ class BacktestEngine:
         symbol = trade.symbol
         qty = trade.quantity
 
+        # Apply the shared cost model: market exits pay slippage + half-spread;
+        # limit "target" exits fill clean.
+        exit_price = self._costs.exit_fill_price(exit_price, trade.direction, exit_reason)
+
         if trade.direction == Direction.LONG:
             gross_pnl = (exit_price - trade.entry_price) * qty
         else:
             gross_pnl = (trade.entry_price - exit_price) * qty
 
-        exit_commission = qty * self._commission_per_share
-        net_pnl = gross_pnl - exit_commission
+        # Short positions accrue a borrow/financing charge for the holding period.
+        days_held = max((exit_time - trade.entry_time).total_seconds() / 86_400.0, 0.0)
+        borrow_cost = self._costs.borrow_cost(
+            trade.entry_price, qty, trade.direction, days_held
+        )
+
+        exit_commission = self._costs.commission(qty)
+        net_pnl = gross_pnl - exit_commission - borrow_cost
         self._equity += net_pnl
 
         trade.exit_time = exit_time
         trade.exit_price = exit_price
         trade.pnl = net_pnl
         trade.commission = trade.commission + exit_commission
+        trade.borrow_cost = borrow_cost
         trade.exit_reason = exit_reason
 
         self._closed_trades.append(trade)

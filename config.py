@@ -57,6 +57,7 @@ class InstrumentConfig:
     intraday_symbols: tuple[str, ...] = ("AAPL", "MSFT", "NVDA", "AMZN")
     bollinger_symbols: tuple[str, ...] = ("MSFT", "NVDA", "AMZN")
     orb_symbols: tuple[str, ...] = ("AMZN",)
+    commodity_symbols: tuple[str, ...] = ("GLD", "USO")
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,13 @@ class RiskConfig:
     max_daily_loss_usd: float = 500.0     # hard stop for the day in dollars
     max_drawdown_pct: float = 0.05        # 5 % from peak triggers kill switch
     risk_per_trade_pct: float = 0.01      # 1 % of capital risked per trade
+    # Correlation / concentration filter: the set of symbols treated as
+    # correlated "risk-on" equity exposure. A new LONG in any of these is
+    # blocked once max_risk_on_positions of them are already open, preventing
+    # piling into correlated risk. (Commodities like GLD/USO are excluded — they
+    # diversify rather than add to risk-on exposure.)
+    risk_on_symbols: tuple[str, ...] = ("QQQ", "MSFT", "NVDA", "AMZN")
+    max_risk_on_positions: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +94,9 @@ class MomentumBreakoutConfig:
     lookback_days: int = 10               # N-day high lookback
     volume_multiplier: float = 1.2        # volume must be 1.2x 20-day average
     profit_target_pct: float = 0.04       # 4 % profit target
-    stop_loss_pct: float = 0.02           # 2 % stop loss
+    stop_loss_pct: float = 0.02           # fallback stop when ATR unavailable
+    atr_period: int = 14
+    atr_stop_multiplier: float = 2.0      # stop = entry - 2 × ATR
     active: bool = True
 
 
@@ -117,6 +127,19 @@ class OpeningRangeBreakoutConfig:
     flat_by: str = "15:45"
 
 
+@dataclass(frozen=True)
+class TrendFollowingConfig:
+    """Parameters for the 4-hour EMA-crossover trend-following strategy."""
+
+    bar_size: str = "4 hours"
+    fast_ema: int = 21                    # fast EMA period
+    slow_ema: int = 55                    # slow EMA period
+    atr_period: int = 14
+    atr_stop_multiplier: float = 2.0      # stop distance = multiplier × ATR
+    atr_target_multiplier: float = 3.0    # target distance = multiplier × ATR
+    active: bool = True
+
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -132,6 +155,18 @@ class DatabaseConfig:
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TelegramConfig:
+    """Telegram bot notification settings."""
+
+    token: str = ""
+    chat_id: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token and self.chat_id)
+
 
 @dataclass(frozen=True)
 class DashboardConfig:
@@ -157,8 +192,10 @@ class AppConfig:
     momentum_breakout: MomentumBreakoutConfig = field(default_factory=MomentumBreakoutConfig)
     bollinger_reversion: BollingerReversionConfig = field(default_factory=BollingerReversionConfig)
     opening_range_breakout: OpeningRangeBreakoutConfig = field(default_factory=OpeningRangeBreakoutConfig)
+    trend_following: TrendFollowingConfig = field(default_factory=TrendFollowingConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
 
     @property
     def is_paper_trading(self) -> bool:
@@ -194,9 +231,15 @@ class AppConfig:
             port=int(os.getenv("DASHBOARD_PORT", "8050")),
         )
 
+        telegram = TelegramConfig(
+            token=os.getenv("TELEGRAM_TOKEN", ""),
+            chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+        )
+
         return cls(
             ibkr=ibkr,
             risk=risk,
             database=database,
             dashboard=dashboard,
+            telegram=telegram,
         )

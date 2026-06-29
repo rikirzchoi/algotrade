@@ -24,6 +24,7 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, date
 from decimal import Decimal
 from typing import Optional
@@ -99,6 +100,17 @@ class Broker(EWrapper, EClient):
 
         # client_order_id (str) → strategy_id for routing fills
         self._strategy_order_map: dict[str, str] = {}
+
+        # symbol → IB order IDs of its resting bracket legs, so a flatten can
+        # cancel them before sending a market close (avoids a stranded OCO leg
+        # re-opening/reversing the position).
+        self._symbol_order_ids: dict[str, list[int]] = {}
+
+        # execId → (FillEvent, created_monotonic). Fills are buffered here by
+        # execDetails until commissionReport delivers the real commission, then
+        # queued. A heartbeat safety-net flushes any that never get a report.
+        self._pending_fills: dict[str, tuple] = {}
+        self._pending_fills_lock = threading.Lock()
 
         # Placeholder; assigned in connect()
         self._heartbeat_thread: threading.Thread = threading.Thread(
@@ -242,6 +254,8 @@ class Broker(EWrapper, EClient):
         parent.action = entry_action
         parent.orderType = "MKT"
         parent.totalQuantity = quantity
+        parent.eTradeOnly = False
+        parent.firmQuoteOnly = False
         parent.transmit = False
 
         # --- Profit target (limit) ---
@@ -252,6 +266,8 @@ class Broker(EWrapper, EClient):
         take_profit.totalQuantity = quantity
         take_profit.lmtPrice = round(profit_target, 2)
         take_profit.parentId = parent_id
+        take_profit.eTradeOnly = False
+        take_profit.firmQuoteOnly = False
         take_profit.transmit = False
 
         # --- Stop loss (stop) ---
@@ -262,6 +278,8 @@ class Broker(EWrapper, EClient):
         stop.totalQuantity = quantity
         stop.auxPrice = round(stop_loss, 2)
         stop.parentId = parent_id
+        stop.eTradeOnly = False
+        stop.firmQuoteOnly = False
         stop.transmit = True  # transmits all three at once
 
         # Register mapping so fills can be routed to the correct strategy
@@ -278,9 +296,63 @@ class Broker(EWrapper, EClient):
             entry_price, profit_target, stop_loss,
             parent_id, profit_id, stop_id,
         )
+        # Record the bracket's legs so flatten_symbol() can cancel them later.
+        self._symbol_order_ids[symbol] = [parent_id, profit_id, stop_id]
+
         self.placeOrder(parent_id, contract, parent)
         self.placeOrder(profit_id, contract, take_profit)
         self.placeOrder(stop_id, contract, stop)
+
+    def flatten_symbol(
+        self,
+        symbol: str,
+        strategy_id: str,
+        quantity: int,
+        position_side: Direction,
+    ) -> None:
+        """Flatten an open position with a market order.
+
+        Cancels the symbol's resting bracket legs first (so the OCO stop/target
+        cannot re-open or reverse the position), then sends a market order in
+        the closing direction. The resulting execution returns through
+        execDetails like any other fill.
+
+        Args:
+            symbol:        Ticker to flatten.
+            strategy_id:   Strategy that owns the position (for fill routing).
+            quantity:      Number of shares to close (absolute value).
+            position_side: Side of the position being closed (LONG or SHORT);
+                           a LONG is closed with SELL, a SHORT with BUY.
+        """
+        if quantity <= 0:
+            return
+
+        # Cancel any resting bracket legs for this symbol.
+        for oid in self._symbol_order_ids.pop(symbol, []):
+            try:
+                EClient.cancelOrder(self, oid, "")
+            except Exception:
+                log.exception("flatten_symbol: failed to cancel order %d", oid)
+
+        close_action = "SELL" if position_side == Direction.LONG else "BUY"
+        order_id = self.get_next_order_id()
+
+        order = Order()
+        order.orderId = order_id
+        order.action = close_action
+        order.orderType = "MKT"
+        order.totalQuantity = quantity
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
+        order.transmit = True
+
+        self._strategy_order_map[str(order_id)] = strategy_id
+
+        log.info(
+            "Flatten %s: %s %d shares (closing %s) [id %d]",
+            symbol, close_action, quantity, position_side.value, order_id,
+        )
+        self.placeOrder(order_id, self._make_contract(symbol), order)
 
     def cancel_order(self, order_id: int) -> None:
         """Cancel an existing order by its IB order ID."""
@@ -406,29 +478,69 @@ class Broker(EWrapper, EClient):
                 direction=direction,
                 quantity=int(execution.shares),
                 fill_price=Decimal(str(execution.price)),
-                commission=Decimal("0.0"),  # updated in commissionReport callback
+                commission=Decimal("0.0"),  # patched in by commissionReport
                 client_order_id=execution.orderId,
                 ib_exec_id=execution.execId,
             )
-            self._event_queue.put(fill)
+            # Buffer until commissionReport arrives so the queued fill carries
+            # the real commission (IBKR sends commissionReport right after).
+            with self._pending_fills_lock:
+                self._pending_fills[execution.execId] = (fill, time.monotonic())
         except Exception:
             log.exception("execDetails: failed to build FillEvent")
 
     def commissionReport(self, commissionReport) -> None:  # noqa: N802
-        """Called after execDetails with actual commission data.
+        """Patch the real commission into the buffered fill and queue it.
 
-        TODO: Update the corresponding FillEvent with the real commission.
-              This requires a pending-fills store keyed by execId so the
-              commission can be patched in and the corrected FillEvent
-              re-queued (or the engine can handle it as a separate event).
-              For now we log it so it is not silently discarded.
+        Called by IBKR right after execDetails for the same execId. We look up
+        the buffered FillEvent, replace its commission with the reported value,
+        and enqueue it for the engine (which books it into realised PnL).
         """
-        log.info(
-            "commissionReport: execId=%s commission=%.4f currency=%s",
-            commissionReport.execId,
-            commissionReport.commission,
-            commissionReport.currency,
-        )
+        try:
+            exec_id = commissionReport.execId
+            raw = float(commissionReport.commission)
+            # IBKR sends a float-max sentinel when commission is unavailable.
+            commission = Decimal("0.0") if raw > 1e30 else Decimal(str(raw))
+
+            with self._pending_fills_lock:
+                entry = self._pending_fills.pop(exec_id, None)
+
+            if entry is None:
+                log.info(
+                    "commissionReport for unknown execId=%s (commission=%s) — ignored",
+                    exec_id, commission,
+                )
+                return
+
+            fill, _created = entry
+            fill = replace(fill, commission=commission)
+            self._event_queue.put(fill)
+            log.info(
+                "Fill finalised: %s %s qty=%d @ %s commission=%s",
+                fill.direction.value, fill.symbol, fill.quantity,
+                fill.fill_price, commission,
+            )
+        except Exception:
+            log.exception("commissionReport: failed to finalise fill")
+
+    def _flush_stale_pending_fills(self, max_age: float = 10.0) -> None:
+        """Queue any buffered fills whose commissionReport never arrived.
+
+        Safety net so a fill is never lost if IBKR omits a commission report.
+        """
+        now = time.monotonic()
+        stale = []
+        with self._pending_fills_lock:
+            for exec_id, (fill, created) in list(self._pending_fills.items()):
+                if now - created >= max_age:
+                    stale.append(fill)
+                    del self._pending_fills[exec_id]
+        for fill in stale:
+            log.warning(
+                "No commissionReport for execId=%s after %.0fs — queuing with commission=0",
+                fill.ib_exec_id, max_age,
+            )
+            self._event_queue.put(fill)
 
     def error(  # noqa: N802
         self,
@@ -519,17 +631,14 @@ class Broker(EWrapper, EClient):
         symbol = self._req_id_to_symbol.get(req_id, "")
         bar_size = self._req_id_to_bar_size.get(req_id, "")
         raw_date: str = bar.date
+        parts = raw_date.strip().split()
 
-        # Intraday timestamps carry a time component; daily bars do not
-        if len(raw_date) > 8:
-            # Strip optional " US/Eastern" or " America/New_York" suffix that
-            # IBKR sometimes appends, then parse
-            date_part = raw_date.split(" ")[0] + " " + raw_date.split(" ")[1]
-            ts = datetime.strptime(date_part, "%Y%m%d %H:%M:%S").replace(tzinfo=ET)
+        if len(parts) >= 2:
+            # Intraday bar: "YYYYMMDD HH:MM:SS" (optional tz suffix ignored)
+            ts = datetime.strptime(parts[0] + " " + parts[1], "%Y%m%d %H:%M:%S").replace(tzinfo=ET)
         else:
-            # Daily bar — represent as midnight ET for consistency
-            d = datetime.strptime(raw_date, "%Y%m%d")
-            ts = d.replace(tzinfo=ET)
+            # Daily bar: "YYYYMMDD" (possibly with trailing whitespace)
+            ts = datetime.strptime(parts[0], "%Y%m%d").replace(tzinfo=ET)
 
         vwap_raw = getattr(bar, "vwap", None) or getattr(bar, "average", None)
         vwap: Optional[Decimal] = (
@@ -561,6 +670,7 @@ class Broker(EWrapper, EClient):
             time.sleep(_HEARTBEAT_INTERVAL)
             if not self.isConnected():
                 break
+            self._flush_stale_pending_fills()
             self._event_queue.put(
                 SystemEvent(
                     kind=SystemEventKind.WARNING,

@@ -19,6 +19,7 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -28,18 +29,38 @@ from config import AppConfig
 from core.broker import Broker
 from core.events import (
     BarEvent,
+    Direction,
     FillEvent,
     SignalEvent,
     SystemEvent,
     SystemEventKind,
 )
 from database.writer import DatabaseWriter
+from notifications.telegram import TelegramNotifier
 from risk.manager import RiskManager
 
 if TYPE_CHECKING:
     from strategies.base import BaseStrategy
 
 _ET = ZoneInfo("America/New_York")
+
+
+@dataclass
+class _OpenPosition:
+    """Authoritative record of one open position, built from actual fills.
+
+    Used by the engine to match closing fills against their opening fills so
+    realised round-trip PnL can be booked into the RiskManager (which drives
+    the daily-loss and drawdown kill switches).
+    """
+
+    symbol: str
+    strategy_id: str
+    side: "Direction"          # LONG or SHORT — the side of the position itself
+    quantity: int
+    entry_price: float
+    entry_time: datetime
+    entry_commission: float = 0.0
 
 
 class TradingEngine:
@@ -80,6 +101,14 @@ class TradingEngine:
         }
         self._state_lock = threading.Lock()
 
+        # Telegram notifier (no-op if not configured)
+        tg = config.telegram
+        self._notifier = TelegramNotifier(tg.token, tg.chat_id) if tg.enabled else _NullNotifier()
+
+        # Authoritative position ledger (symbol → open position), built from
+        # fills. Drives round-trip PnL accounting and the risk kill switches.
+        self._open_positions: dict[str, _OpenPosition] = {}
+
         # Daily reset tracking
         self._reset_done_today: bool = False
         self._reset_date: object = None  # datetime.date | None
@@ -108,6 +137,8 @@ class TradingEngine:
         """Start all components and enter the main event loop (blocks)."""
         self._db.start()
         self._broker.connect()
+        self._notifier.notify_engine_start(self._config.is_paper_trading)
+        self._notifier.start_daily_summary(self)
 
         # Request historical (+ live) data for every unique (symbol, bar_size)
         req_id = 1
@@ -118,7 +149,7 @@ class TradingEngine:
                 if key in seen:
                     continue
                 seen.add(key)
-                duration = "1 Y" if strategy.bar_size == "1 day" else "5 D"
+                duration = self._history_duration(strategy.bar_size)
                 self._broker.request_historical_data(
                     req_id, symbol, strategy.bar_size, duration
                 )
@@ -205,13 +236,13 @@ class TradingEngine:
             if kind == "historical":
                 self._db.write(bar)
                 for strategy in self._strategies:
-                    if bar.symbol in strategy.symbols and strategy.is_active:
+                    if self._strategy_wants(strategy, bar):
                         strategy.on_bar(bar)
                         # Historical bars warm up indicators only — no orders
             elif kind == "realtime":
                 self._db.write(bar)
                 for strategy in self._strategies:
-                    if bar.symbol in strategy.symbols and strategy.is_active:
+                    if self._strategy_wants(strategy, bar):
                         signal = strategy.on_bar(bar)
                         if signal is not None:
                             self._handle_signal(signal, strategy)
@@ -221,13 +252,19 @@ class TradingEngine:
                 if strategy.strategy_id == item.strategy_id:
                     strategy.on_fill(item)
             self._risk.record_fill(item)
+            self._account_for_fill(item)
             self._update_state_on_fill(item)
+            self._notifier.notify_fill(item)
         elif isinstance(item, SystemEvent):
             self._db.write(item)
             if item.kind in (
                 SystemEventKind.ENGINE_STOP,
                 SystemEventKind.KILL_SWITCH,
             ):
+                if item.kind == SystemEventKind.KILL_SWITCH:
+                    self._notifier.notify_kill_switch()
+                elif "closed" in item.message.lower() or "disconnected" in item.message.lower():
+                    self._notifier.notify_connection_lost()
                 self.stop()
             elif (
                 item.kind == SystemEventKind.WARNING
@@ -249,6 +286,28 @@ class TradingEngine:
         self._db.write(signal)
         if not approved:
             self._logger.info("Signal rejected: %s", reason)
+            return
+
+        # FLAT: close the open position with a market order (cancels its resting
+        # bracket legs first). Sizing/levels do not apply.
+        if signal.direction == Direction.FLAT:
+            pos = self._open_positions.get(signal.symbol)
+            if pos is None:
+                self._logger.info(
+                    "FLAT signal for %s but no open position to close",
+                    signal.symbol,
+                )
+                return
+            self._broker.flatten_symbol(
+                symbol=signal.symbol,
+                strategy_id=signal.strategy_id,
+                quantity=pos.quantity,
+                position_side=pos.side,
+            )
+            self._logger.info(
+                "Flattening %s: %s %d shares",
+                signal.symbol, pos.side.name, pos.quantity,
+            )
             return
 
         levels = strategy.get_pending_levels(signal.symbol)
@@ -283,6 +342,40 @@ class TradingEngine:
             levels["target"],
         )
 
+    @staticmethod
+    def _strategy_wants(strategy: "BaseStrategy", bar: BarEvent) -> bool:
+        """True if *bar* should be delivered to *strategy*.
+
+        Must match BOTH symbol and bar size: two strategies can watch the same
+        symbol at different bar sizes (e.g. AMZN 15-min for Bollinger and 5-min
+        for ORB), and each must only receive its own bar size — otherwise their
+        indicator histories cross-contaminate.
+        """
+        return (
+            strategy.is_active
+            and bar.symbol in strategy.symbols
+            and strategy.bar_size == bar.bar_size
+        )
+
+    @staticmethod
+    def _history_duration(bar_size: str) -> str:
+        """Pick a historical-data window large enough to warm up indicators.
+
+        Critically, 4-hour bars need enough history for long EMAs (the trend
+        strategy's 55-period slow EMA needs ~55 RTH bars ≈ many weeks); the old
+        flat "5 D" gave only ~10 bars, so that strategy could never warm up or
+        trade.
+        """
+        return {
+            "1 day":   "1 Y",
+            "4 hours": "6 M",   # ~250 RTH 4H bars — well past a 55-bar warm-up
+            "1 hour":  "2 M",
+            "30 mins": "1 M",
+            "15 mins": "10 D",
+            "5 mins":  "5 D",
+            "1 min":   "2 D",
+        }.get(bar_size, "10 D")
+
     def _aggregate_positions(self) -> dict[str, int]:
         """Merge per-strategy positions into one combined dict."""
         combined: dict[str, int] = {}
@@ -290,6 +383,129 @@ class TradingEngine:
             for symbol, qty in strategy.positions.items():
                 combined[symbol] = combined.get(symbol, 0) + qty
         return combined
+
+    def _account_for_fill(self, fill: FillEvent) -> None:
+        """Maintain the position ledger and book realised PnL on round-trips.
+
+        The broker reports a fill's ``direction`` as the *execution* side
+        (BOT → LONG, SLD → SHORT), not the strategy's intent. This method pairs
+        each closing fill with its opening fill, computes realised PnL, and
+        feeds it to the RiskManager so the daily-loss and drawdown kill switches
+        actually fire. Runs on the single event-loop thread, so the ledger
+        needs no extra lock.
+        """
+        symbol = fill.symbol
+        exec_is_buy = fill.direction == Direction.LONG  # BOT=LONG, SLD=SHORT
+        qty = int(fill.quantity)
+        if qty <= 0:
+            return
+        price = float(fill.fill_price)
+        commission = float(fill.commission)
+
+        open_pos = self._open_positions.get(symbol)
+
+        # --- Opening a brand-new position --------------------------------
+        if open_pos is None:
+            self._open_positions[symbol] = _OpenPosition(
+                symbol=symbol,
+                strategy_id=fill.strategy_id,
+                side=Direction.LONG if exec_is_buy else Direction.SHORT,
+                quantity=qty,
+                entry_price=price,
+                entry_time=fill.timestamp,
+                entry_commission=commission,
+            )
+            return
+
+        opening_is_buy = open_pos.side == Direction.LONG
+
+        # --- Adding to the same side: update weighted-average entry -------
+        if exec_is_buy == opening_is_buy:
+            total_qty = open_pos.quantity + qty
+            if total_qty > 0:
+                open_pos.entry_price = (
+                    open_pos.entry_price * open_pos.quantity + price * qty
+                ) / total_qty
+            open_pos.quantity = total_qty
+            open_pos.entry_commission += commission
+            return
+
+        # --- Opposite side: closing (fully or partially) -----------------
+        close_qty = min(qty, open_pos.quantity)
+        entry_comm_share = (
+            open_pos.entry_commission * (close_qty / open_pos.quantity)
+            if open_pos.quantity
+            else 0.0
+        )
+        was_halted = self._risk.is_halted
+
+        pnl = self._risk.record_close(
+            symbol=symbol,
+            entry_price=open_pos.entry_price,
+            exit_price=price,
+            quantity=close_qty,
+            direction=open_pos.side,
+            commission=entry_comm_share + commission,
+        )
+        self._logger.info(
+            "Round-trip closed: %s %s qty=%d entry=%.2f exit=%.2f pnl=%.2f",
+            open_pos.side.name, symbol, close_qty,
+            open_pos.entry_price, price, pnl,
+        )
+
+        # Reduce or remove the ledger entry
+        open_pos.entry_commission -= entry_comm_share
+        open_pos.quantity -= close_qty
+        if open_pos.quantity <= 0:
+            self._open_positions.pop(symbol, None)
+            # Rare: exit qty exceeded the position (a flip) — open the remainder
+            remainder = qty - close_qty
+            if remainder > 0:
+                self._open_positions[symbol] = _OpenPosition(
+                    symbol=symbol,
+                    strategy_id=fill.strategy_id,
+                    side=Direction.LONG if exec_is_buy else Direction.SHORT,
+                    quantity=remainder,
+                    entry_price=price,
+                    entry_time=fill.timestamp,
+                    entry_commission=0.0,
+                )
+
+        # Surface a newly-triggered automatic halt
+        if self._risk.is_halted and not was_halted:
+            self._on_risk_halt()
+
+    def _on_risk_halt(self) -> None:
+        """Surface an automatic risk-triggered kill switch.
+
+        Alerts via Telegram, writes an audit SystemEvent, and updates dashboard
+        state. Deliberately does NOT call stop(): new entries are blocked (via
+        RiskManager.is_halted), but resting bracket stops/targets stay live to
+        keep protecting any open positions.
+        """
+        msg = (
+            f"Automatic kill switch tripped: "
+            f"daily_pnl={self._risk.daily_pnl:.2f} "
+            f"drawdown={self._risk.current_drawdown_pct:.1%}. "
+            f"New entries blocked; resting stops/targets remain active."
+        )
+        self._logger.critical(msg)
+        try:
+            self._db.write(
+                SystemEvent(
+                    kind=SystemEventKind.KILL_SWITCH,
+                    timestamp=datetime.now(_ET),
+                    message=msg,
+                )
+            )
+        except Exception:
+            self._logger.exception("Failed to persist kill-switch event")
+        with self._state_lock:
+            self._state["is_halted"] = True
+        try:
+            self._notifier.notify_kill_switch()
+        except Exception:
+            self._logger.exception("Failed to send kill-switch notification")
 
     def _check_market_open_reset(self) -> None:
         """Call daily reset once per day inside the 09:29–09:31 ET window."""
@@ -341,6 +557,16 @@ class TradingEngine:
             self._state["active_strategies"] = [
                 s.strategy_id for s in self._strategies if s.is_active
             ]
+
+
+class _NullNotifier:
+    """No-op notifier used when Telegram is not configured."""
+    def notify_fill(self, fill: object) -> None: pass
+    def notify_kill_switch(self) -> None: pass
+    def notify_connection_lost(self) -> None: pass
+    def notify_connection_restored(self) -> None: pass
+    def notify_engine_start(self, paper: bool) -> None: pass
+    def start_daily_summary(self, engine: object) -> None: pass
 
 
 # ---------------------------------------------------------------------------

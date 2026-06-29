@@ -216,6 +216,31 @@ def bollinger_bands(
         return empty, empty, empty
 
 
+def atr(
+    highs: pd.Series,
+    lows: pd.Series,
+    closes: pd.Series,
+    period: int = 14,
+) -> float:
+    """Average True Range using Wilder's exponential smoothing (alpha = 1/period).
+
+    Returns the most recent ATR value, or NaN if insufficient data.
+    Never raises.
+    """
+    try:
+        if len(closes) < period + 1:
+            return float("nan")
+        prev_close = closes.shift(1)
+        tr = pd.concat(
+            [highs - lows, (highs - prev_close).abs(), (lows - prev_close).abs()],
+            axis=1,
+        ).max(axis=1)
+        return float(tr.ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
+    except Exception:
+        logger.exception("atr: unexpected error")
+        return float("nan")
+
+
 # ---------------------------------------------------------------------------
 # Market-structure / volume helpers
 # ---------------------------------------------------------------------------

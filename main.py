@@ -1,6 +1,12 @@
 """
 main.py — application entry point.
 
+NOTE (2026-06): the strategies wired below (momentum, bollinger, ORB, trend) were
+rigorously backtested and found to have NO edge — see DECISIONS.md. The validated
+approach is the 60/40 trend+equity ETF core (TRADING_RULES.md), which does not
+need this engine. This live engine is retained for reference and for future
+*satellite* strategies — do not deploy the rejected ones with real money.
+
 Wires every component together in the correct order:
 
 1. Load AppConfig (reads .env, applies defaults)
@@ -24,10 +30,12 @@ import threading
 
 from config import AppConfig
 from core.engine import TradingEngine
-from dashboard.app import run_dashboard
+import uvicorn
+from dashboard.server import create_server
 from strategies.momentum_breakout import MomentumBreakoutStrategy
 from strategies.bollinger_reversion import BollingerReversionStrategy
 from strategies.opening_range_breakout import OpeningRangeBreakoutStrategy
+from strategies.trend_following import TrendFollowingStrategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +51,7 @@ def main() -> None:
     engine.register_strategy(MomentumBreakoutStrategy(cfg))
     engine.register_strategy(BollingerReversionStrategy(cfg))
     engine.register_strategy(OpeningRangeBreakoutStrategy(cfg))
+    engine.register_strategy(TrendFollowingStrategy(cfg))
 
     def _shutdown(sig: int, frame: object) -> None:
         print("\nShutting down...")
@@ -53,13 +62,15 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
 
     if "--no-dashboard" not in sys.argv:
-        dash_thread = threading.Thread(
-            target=run_dashboard,
-            args=(engine, cfg),
+        api = create_server(engine, cfg)
+        api_thread = threading.Thread(
+            target=uvicorn.run,
+            kwargs={"app": api, "host": "0.0.0.0", "port": 8000, "log_level": "warning"},
             daemon=True,
         )
-        dash_thread.start()
-        print(f"Dashboard: http://{cfg.dashboard.host}:{cfg.dashboard.port}")
+        api_thread.start()
+        print(f"API:       http://0.0.0.0:8000/api/docs")
+        print(f"Dashboard: http://localhost:3000")
 
     mode = "PAPER TRADING" if cfg.is_paper_trading else "LIVE TRADING"
     print(f"\n{'='*50}")

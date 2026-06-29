@@ -105,6 +105,16 @@ class DatabaseWriter:
             );
             CREATE INDEX IF NOT EXISTS idx_bars_symbol_ts ON bars(symbol, timestamp);
 
+            -- Migration: remove duplicate bars (re-ingested on every engine
+            -- restart) keeping the earliest row, then enforce uniqueness so
+            -- duplicates can never be inserted again. Idempotent.
+            DELETE FROM bars
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM bars GROUP BY symbol, timestamp, bar_size
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_bars_unique
+                ON bars(symbol, timestamp, bar_size);
+
             CREATE TABLE IF NOT EXISTS signals (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 strategy_id TEXT    NOT NULL,
@@ -209,7 +219,7 @@ class DatabaseWriter:
 
     def _insert_bar(self, conn: sqlite3.Connection, event: BarEvent) -> None:
         conn.execute(
-            """INSERT INTO bars (symbol, timestamp, open, high, low, close, volume, bar_size, vwap)
+            """INSERT OR IGNORE INTO bars (symbol, timestamp, open, high, low, close, volume, bar_size, vwap)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 event.symbol,

@@ -48,3 +48,13 @@ data/
 *.db
 *.db-shm
 *.db-wal
+logs/
+
+# Node / Next.js dashboard (dashboard-ui/)
+node_modules/
+.next/
+
+# IBKR / TWS installers (downloaded binaries, not source)
+tws-latest-linux-x64.sh
+ntws-latest-standalone-linux-x64.sh
+ntws-latest-standalone-linux-x64.sh*.dir/

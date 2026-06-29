@@ -19,8 +19,12 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import math
+
+import pandas as pd
+
 from config import AppConfig
-from core.data import anchored_vwap, average_volume
+from core.data import anchored_vwap, atr, average_volume
 from core.events import BarEvent, Direction, FillEvent, SignalEvent
 from strategies.base import BaseStrategy
 
@@ -109,7 +113,16 @@ class MomentumBreakoutStrategy(BaseStrategy):
                 return None
 
             profit_target = close * (1 + params.profit_target_pct)
-            stop_loss = close * (1 - params.stop_loss_pct)
+            atr_val = atr(
+                pd.Series(history.highs),
+                pd.Series(history.lows),
+                pd.Series(history.closes),
+                params.atr_period,
+            )
+            if not math.isnan(atr_val) and atr_val > 0:
+                stop_loss = close - atr_val * params.atr_stop_multiplier
+            else:
+                stop_loss = close * (1 - params.stop_loss_pct)
             strength = min(1.0, vol / (avg_vol * params.volume_multiplier))
             reason = (
                 f"20d high breakout: close={close:.2f} > "

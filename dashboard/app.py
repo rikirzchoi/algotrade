@@ -32,6 +32,7 @@ import plotly.graph_objects as go
 from dash import Input, Output, State, callback_context, dcc, html
 
 import database.queries as queries
+from database.queries import get_last_bars_summary
 from config import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,63 @@ def _empty_table_row(message: str, cols: int) -> html.Tr:
 
 def _pnl_color(value: float) -> str:
     return "#00c853" if value >= 0 else "#ff1744"
+
+
+def _build_market_snapshot(db_path) -> html.Div:
+    """Compact row of mini-cards showing last price and daily % change per symbol."""
+    try:
+        df = get_last_bars_summary(db_path)
+    except Exception:
+        df = pd.DataFrame()
+
+    if df.empty:
+        return html.Div(
+            html.Small("No bar data yet — waiting for first bars",
+                       style={"color": "#6b7280", "fontStyle": "italic"}),
+            style={"padding": "8px 0"},
+        )
+
+    cards = []
+    for _, row in df.iterrows():
+        symbol = str(row.get("symbol", ""))
+        last_price = row.get("last_price")
+        change_pct = row.get("change_pct")
+
+        price_str = f"${float(last_price):.2f}" if pd.notna(last_price) else "—"
+        if pd.notna(change_pct):
+            chg = float(change_pct)
+            chg_color = "#00c853" if chg >= 0 else "#ff1744"
+            chg_str = f"{chg:+.2f}%"
+        else:
+            chg_color = "#6b7280"
+            chg_str = "—"
+
+        cards.append(html.Div([
+            html.Div(symbol, style={
+                "fontSize": "11px", "fontWeight": "600",
+                "textTransform": "uppercase", "letterSpacing": "0.08em",
+                "color": "#6b7280", "marginBottom": "4px",
+            }),
+            html.Div(price_str, style={
+                "fontSize": "20px", "fontWeight": "700",
+                "color": "var(--text-primary)", "lineHeight": "1",
+                "marginBottom": "2px",
+            }),
+            html.Div(chg_str, style={
+                "fontSize": "12px", "fontWeight": "600", "color": chg_color,
+            }),
+        ], style={
+            "background": "var(--bg-card)",
+            "border": "1px solid var(--border-card)",
+            "borderRadius": "12px",
+            "padding": "14px 18px",
+            "minWidth": "110px",
+            "boxShadow": "var(--shadow-card)",
+        }))
+
+    return html.Div(cards, style={
+        "display": "flex", "gap": "12px", "flexWrap": "wrap",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +513,12 @@ def _overview_page(strategy_ids: list[str] | None = None) -> html.Div:
             _stat_card("Total PnL", "perf-total-pnl",   "#00c853", "$0.00", "card-accent-green"),
         ], className="mb-4 mt-3", style={"--bs-gutter-x": "16px"}),
 
-        # Row 2 — Live equity curve
+        # Row 2 — Market snapshot (last price per symbol)
+        dbc.Row([
+            dbc.Col(html.Div(id="market-snapshot"), width=12),
+        ], className="mb-4"),
+
+        # Row 3 — Live equity curve
         dbc.Row([
             dbc.Col(html.Div(
                 dcc.Graph(id="live-equity-chart", figure=_empty_figure()),
@@ -754,6 +817,7 @@ def _register_callbacks(
             Output("resume-btn", "style"),
             Output("positions-table", "children"),
             Output("fills-table", "children"),
+            Output("market-snapshot", "children"),
         ],
         Input("live-interval", "n_intervals"),
     )
@@ -851,10 +915,12 @@ def _register_callbacks(
         positions = state.get("positions", {})
         pos_tbl = _build_positions_table(positions)
 
+        snapshot = _build_market_snapshot(cfg.database.db_path)
+
         return (
             fig, pnl_text, dd_text, conn_text,
             halted_content, resume_style,
-            pos_tbl, fills_tbl,
+            pos_tbl, fills_tbl, snapshot,
         )
 
     # ------------------------------------------------------------------
@@ -1919,7 +1985,7 @@ def create_app(eng, cfg: AppConfig) -> dash.Dash:
                         "fontSize": "12px", "color": "var(--text-muted)",
                         "marginRight": "8px", "userSelect": "none",
                     }),
-                    dbc.Switch(id="theme-toggle", value=False,
+                    dbc.Switch(id="theme-toggle", value=True,
                                style={"display": "inline-block", "cursor": "pointer"}),
                     html.Span("Dark", style={
                         "fontSize": "12px", "color": "var(--text-muted)",

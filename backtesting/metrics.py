@@ -88,9 +88,19 @@ class BacktestMetrics:
 
     @property
     def annualised_return(self) -> float:
-        """CAGR implied by the equity curve."""
+        """CAGR implied by the equity curve.
+
+        For short samples (< ~3 months of trading days) the non-annualised
+        total return is returned instead: extrapolating a few weeks to a full
+        year (e.g. 5% over 10 days → "240% annualised") is misleading rather
+        than informative.
+        """
         if self._trading_days < 2:
             return 0.0
+        if self._final_equity <= 0:
+            return -1.0
+        if self._trading_days < 63:          # < ~3 months — don't extrapolate
+            return self.total_return
         try:
             return (self._final_equity / self._initial_capital) ** (252 / self._trading_days) - 1
         except (ZeroDivisionError, ValueError):
@@ -106,6 +116,94 @@ class BacktestMetrics:
             return 0.0
         mean = float(self._daily_returns.mean())
         return (mean - self._risk_free_rate / 252) / std * math.sqrt(252)
+
+    # ------------------------------------------------------------------
+    # Statistical significance — "is this edge or luck?"
+    # ------------------------------------------------------------------
+
+    @property
+    def _daily_sharpe(self) -> float:
+        """Non-annualised Sharpe of daily excess returns."""
+        if self._daily_returns.empty:
+            return 0.0
+        std = float(self._daily_returns.std())
+        if std == 0.0:
+            return 0.0
+        mean = float(self._daily_returns.mean())
+        return (mean - self._risk_free_rate / 252) / std
+
+    @property
+    def num_return_observations(self) -> int:
+        """Number of daily return observations behind the Sharpe estimate."""
+        return int(len(self._daily_returns))
+
+    @property
+    def sharpe_tstat(self) -> float:
+        """t-statistic for H0: Sharpe == 0. |t| > 1.96 ≈ significant at 95%."""
+        n = self.num_return_observations
+        if n < 2:
+            return 0.0
+        return self._daily_sharpe * math.sqrt(n)
+
+    @property
+    def sharpe_ci_95(self) -> tuple[float, float]:
+        """Approximate 95% confidence interval for the ANNUALISED Sharpe.
+
+        Uses the Lo (2002) IID standard error SE(SR) ≈ sqrt((1 + 0.5·SR²)/n).
+        A CI that straddles zero means the strategy has no demonstrated edge.
+        """
+        n = self.num_return_observations
+        if n < 2:
+            return (0.0, 0.0)
+        sr_d = self._daily_sharpe
+        se_d = math.sqrt((1.0 + 0.5 * sr_d ** 2) / n)
+        ann = math.sqrt(252)
+        return ((sr_d - 1.96 * se_d) * ann, (sr_d + 1.96 * se_d) * ann)
+
+    @property
+    def probabilistic_sharpe_ratio(self) -> float:
+        """Probability the true Sharpe exceeds 0, in [0, 1].
+
+        The Probabilistic Sharpe Ratio (Bailey & López de Prado) corrects the
+        naive Sharpe for sample length, skewness and kurtosis. PSR ≥ 0.95 is a
+        reasonable bar for "this is unlikely to be luck."
+        """
+        n = self.num_return_observations
+        if n < 3:
+            return 0.0
+        sr = self._daily_sharpe
+        if sr == 0.0:
+            return 0.5
+        try:
+            from scipy.stats import kurtosis, norm, skew
+            r = self._daily_returns
+            g3 = float(skew(r))
+            g4 = float(kurtosis(r, fisher=False))   # 3.0 for a normal dist
+            denom = math.sqrt(1.0 - g3 * sr + ((g4 - 1.0) / 4.0) * sr ** 2)
+            if denom <= 0:
+                return 0.0
+            return float(norm.cdf((sr * math.sqrt(n - 1)) / denom))
+        except Exception:
+            logger.warning("PSR computation failed", exc_info=True)
+            return 0.0
+
+    @property
+    def is_significant(self) -> bool:
+        """Whether results clear a minimum bar to be taken seriously.
+
+        Requires a positive Sharpe significant at ~95% (PSR) over enough return
+        observations (≥ ~1 year of daily data). For *discrete* strategies it also
+        requires ≥30 trades — a high Sharpe over a handful of trades is noise. A
+        *continuous* strategy (no trade-list entries, e.g. a daily-rebalanced
+        overlay) is judged on PSR + observation count instead.
+        """
+        base = (
+            self.probabilistic_sharpe_ratio >= 0.95
+            and self.num_return_observations >= 252
+        )
+        if self.trade_count > 0:
+            return base and self.trade_count >= 30
+        return base
 
     # ------------------------------------------------------------------
     # Drawdown metrics
@@ -235,6 +333,8 @@ class BacktestMetrics:
         title1 = f"  Backtest: {r.strategy_id} / {r.symbol}"
         title2 = f"  {r.start_date} → {r.end_date}"
 
+        ci_lo, ci_hi = self.sharpe_ci_95
+
         lines = [
             top,
             f"│{title1:<{width}}│",
@@ -245,6 +345,12 @@ class BacktestMetrics:
             row("Sharpe ratio",    f"{self.sharpe_ratio:.2f}"),
             row("Max drawdown",    f"{self.max_drawdown:.1%}"),
             row("Max DD duration", f"{self.max_drawdown_duration} days"),
+            divider,
+            row("Sharpe t-stat",   f"{self.sharpe_tstat:.2f}"),
+            row("Sharpe 95% CI",   f"{ci_lo:.2f} … {ci_hi:.2f}"),
+            row("PSR (P[SR>0])",   f"{self.probabilistic_sharpe_ratio:.0%}"),
+            row("Significant?",    "YES" if self.is_significant
+                                   else "NO — treat as noise"),
             divider,
             row("Trades",          str(self.trade_count)),
             row("Trades/day",      f"{self.trades_per_day:.2f}"),

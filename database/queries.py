@@ -56,7 +56,7 @@ def get_recent_bars(
         return pd.DataFrame()
     try:
         df = pd.read_sql_query(
-            """SELECT id, symbol, timestamp, open, high, low, close, volume, bar_size, vwap
+            """SELECT symbol, timestamp, open, high, low, close, volume, bar_size, vwap
                FROM bars
                WHERE symbol = ? AND bar_size = ?
                ORDER BY timestamp DESC
@@ -64,7 +64,9 @@ def get_recent_bars(
             conn,
             params=(symbol, bar_size, limit),
         )
-        return df.iloc[::-1].reset_index(drop=True)
+        # Drop duplicate timestamps (can occur after engine restarts re-ingest history)
+        df = df.drop_duplicates(subset=["timestamp"]).iloc[::-1].reset_index(drop=True)
+        return df
     except sqlite3.Error:
         return pd.DataFrame()
     finally:
@@ -335,6 +337,54 @@ def get_system_events(
         )
         return df.iloc[::-1].reset_index(drop=True)
     except sqlite3.Error:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
+def get_last_bars_summary(db_path: Path) -> pd.DataFrame:
+    """Return the most recent bar for each symbol plus today's opening bar.
+
+    Columns: symbol, last_price, last_ts, day_open, change_pct
+    Used by the dashboard market-snapshot panel.
+    """
+    conn = _open_ro(db_path)
+    if conn is None:
+        return pd.DataFrame()
+    try:
+        last_df = pd.read_sql_query(
+            """SELECT b.symbol,
+                      CAST(b.close AS REAL) AS last_price,
+                      b.timestamp            AS last_ts
+               FROM bars b
+               JOIN (SELECT symbol, MAX(timestamp) AS mt
+                     FROM bars GROUP BY symbol) m
+               ON b.symbol = m.symbol AND b.timestamp = m.mt""",
+            conn,
+        )
+        if last_df.empty:
+            return pd.DataFrame()
+
+        today = date.today().isoformat()
+        open_df = pd.read_sql_query(
+            """SELECT b.symbol,
+                      CAST(b.open AS REAL) AS day_open
+               FROM bars b
+               JOIN (SELECT symbol, MIN(timestamp) AS mt
+                     FROM bars
+                     WHERE DATE(timestamp) = ?
+                     GROUP BY symbol) m
+               ON b.symbol = m.symbol AND b.timestamp = m.mt""",
+            conn,
+            params=(today,),
+        )
+
+        merged = last_df.merge(open_df, on="symbol", how="left")
+        merged["change_pct"] = (
+            (merged["last_price"] - merged["day_open"]) / merged["day_open"] * 100
+        ).where(merged["day_open"].notna())
+        return merged.sort_values("symbol").reset_index(drop=True)
+    except Exception:
         return pd.DataFrame()
     finally:
         conn.close()

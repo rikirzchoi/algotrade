@@ -44,6 +44,7 @@ class RiskManager:
         self._current_equity: float = config.risk.capital
         self._daily_pnl: float = 0.0
         self._is_halted: bool = False
+        self._halt_reason: Optional[str] = None
         self._logger = logging.getLogger("risk.manager")
 
     # ------------------------------------------------------------------
@@ -65,8 +66,9 @@ class RiskManager:
           1. Kill switch active
           2. FLAT signals always approved
           3. Symbol already has an open position
-          4. Daily loss limit reached
-          5. Max drawdown exceeded
+          4. Correlation filter (too many correlated risk-on positions already open)
+          5. Daily loss limit reached
+          6. Max drawdown exceeded
         """
         with self._lock:
             if self._is_halted:
@@ -77,6 +79,20 @@ class RiskManager:
 
             if all_positions.get(signal.symbol, 0) != 0:
                 return False, f"already in position for {signal.symbol}"
+
+            if signal.direction == Direction.LONG:
+                risk_on = self._config.risk.risk_on_symbols
+                limit = self._config.risk.max_risk_on_positions
+                if signal.symbol in risk_on:
+                    open_risk_on = sum(
+                        1 for s in risk_on if all_positions.get(s, 0) > 0
+                    )
+                    if open_risk_on >= limit:
+                        return (
+                            False,
+                            f"correlation filter: {open_risk_on} risk-on positions "
+                            f"already open (limit {limit})",
+                        )
 
             if self._daily_pnl <= -self._config.risk.max_daily_loss_usd:
                 return (
@@ -105,25 +121,27 @@ class RiskManager:
         Optionally applies a macro regime multiplier if the regime module is
         available; silently skips it if the import fails.
         """
-        capital = self._config.risk.capital
-        risk_per_trade_pct = self._config.risk.risk_per_trade_pct
-        max_position_size = self._config.risk.max_position_size
+        from risk.sizing import fixed_fractional
 
-        risk_dollars = capital * risk_per_trade_pct
-        risk_per_share = abs(entry_price - stop_loss_price)
+        # Core fixed-fractional math — the single shared sizing function also
+        # used by the backtester, so backtest and live size identically.
+        qty = fixed_fractional(
+            self._config.risk.capital,
+            self._config.risk.risk_per_trade_pct,
+            entry_price,
+            stop_loss_price,
+            self._config.risk.max_position_size,
+        )
 
-        if risk_per_share <= 0:
-            return 1
-
-        qty = math.floor(risk_dollars / risk_per_share)
-        qty = max(1, min(qty, max_position_size))
-
+        # Macro regime overlay (live + backtest both apply it via this path).
         try:
-            from macro.regime import get_position_size_multiplier  # type: ignore
-            multiplier = get_position_size_multiplier()
+            from macro.regime import get_position_size_multiplier, load_regime
+            multiplier = get_position_size_multiplier(load_regime())
             qty = math.floor(qty * multiplier)
         except Exception:
-            pass
+            self._logger.exception(
+                "macro multiplier failed; using unscaled size"
+            )
 
         return qty
 
@@ -152,12 +170,24 @@ class RiskManager:
         exit_price: float,
         quantity: int,
         direction: Direction,
-    ) -> None:
+        commission: float = 0.0,
+    ) -> float:
         """
         Calculate trade PnL and update equity/drawdown state.
 
         Triggers the kill switch automatically if daily loss or drawdown
         thresholds are breached.
+
+        Parameters
+        ----------
+        direction : the side of the *position* being closed (LONG or SHORT),
+                    not the side of the closing execution.
+        commission : total round-trip commission to deduct from realised PnL.
+
+        Returns
+        -------
+        float
+            Realised net PnL for this close (after commission).
         """
         if direction == Direction.LONG:
             pnl = (exit_price - entry_price) * quantity
@@ -165,6 +195,8 @@ class RiskManager:
             pnl = (entry_price - exit_price) * quantity
         else:
             pnl = 0.0
+
+        pnl -= commission
 
         with self._lock:
             self._daily_pnl += pnl
@@ -180,10 +212,13 @@ class RiskManager:
         elif drawdown_snap >= self._config.risk.max_drawdown_pct:
             self.trigger_halt("max drawdown")
 
+        return pnl
+
     def trigger_halt(self, reason: str) -> None:
         """Activate the kill switch and log a CRITICAL alert."""
         with self._lock:
             self._is_halted = True
+            self._halt_reason = reason
             self._logger.critical(
                 "KILL SWITCH TRIGGERED: %s | daily_pnl=%.2f drawdown=%.1f%%",
                 reason,
@@ -192,9 +227,18 @@ class RiskManager:
             )
 
     def reset_daily(self) -> None:
-        """Reset daily PnL at the start of a new session. Equity is preserved."""
+        """Reset daily PnL at the start of a new session. Equity is preserved.
+
+        A **daily-loss** halt is a daily circuit breaker — it clears on the new
+        day (you'd resume next morning). A **drawdown** halt is persistent and
+        only a manual resume() clears it.
+        """
         with self._lock:
             self._daily_pnl = 0.0
+            if self._is_halted and self._halt_reason == "daily loss limit":
+                self._is_halted = False
+                self._halt_reason = None
+                self._logger.info("New day — daily-loss halt cleared.")
             self._logger.info(
                 "Daily PnL reset. Peak equity: %.2f", self._peak_equity
             )
@@ -203,6 +247,7 @@ class RiskManager:
         """Manually clear the kill switch. Use with caution."""
         with self._lock:
             self._is_halted = False
+            self._halt_reason = None
             self._logger.warning("Kill switch manually cleared. Monitor closely.")
 
     # ------------------------------------------------------------------
