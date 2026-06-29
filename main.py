@@ -43,9 +43,30 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+# IB live-trading sockets: 7496 = TWS live, 4001 = Gateway live. Paper uses
+# 7497 / 4002. The strategies wired in this file have NO validated edge
+# (see DECISIONS.md), so the engine must never reach a live port by accident.
+LIVE_PORTS = {7496, 4001}
+
 
 def main() -> None:
     cfg = AppConfig.from_env()
+
+    # --- Live-trading guard -------------------------------------------------
+    # Refuse to start on a live IB port unless explicitly forced. This encodes
+    # TRADING_RULES.md into the code: the rejected strategies cannot run with
+    # real money via a fat-fingered IB_PORT.
+    if cfg.ibkr.port in LIVE_PORTS and "--force-live" not in sys.argv:
+        print(
+            "\n" + "=" * 62 + "\n"
+            f"  REFUSING TO START — live IB port detected (IB_PORT={cfg.ibkr.port}).\n"
+            "  The strategies wired in main.py have NO validated edge\n"
+            "  (see DECISIONS.md); running them with real money violates\n"
+            "  TRADING_RULES.md. Use the paper port (7497) instead.\n\n"
+            "  If you genuinely intend live trading, re-run with --force-live.\n"
+            + "=" * 62 + "\n"
+        )
+        sys.exit(1)
 
     engine = TradingEngine(cfg)
     engine.register_strategy(MomentumBreakoutStrategy(cfg))
