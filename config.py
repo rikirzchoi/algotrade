@@ -178,6 +178,24 @@ class DashboardConfig:
     perf_update_interval_ms: int = 60_000
 
 
+@dataclass(frozen=True)
+class MarketDataConfig:
+    """Live market-data watchdog settings.
+
+    Guards against the silent failure where the engine stays connected and
+    heartbeating but receives no live bars (e.g. a dead keepUpToDate stream or a
+    missing real-time data subscription). During regular trading hours, if no
+    live bar arrives for `staleness_timeout_seconds`, the engine raises a loud
+    ERROR + alert (and optionally re-requests the subscriptions).
+    """
+
+    watchdog_enabled: bool = True
+    staleness_timeout_seconds: int = 300        # 5 min with no live bar in RTH → alert
+    resubscribe_on_stale: bool = True
+    rth_start: tuple[int, int] = (9, 30)
+    rth_end: tuple[int, int] = (16, 0)
+
+
 # ---------------------------------------------------------------------------
 # Root config — instantiated once in main.py
 # ---------------------------------------------------------------------------
@@ -196,6 +214,7 @@ class AppConfig:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    market_data: MarketDataConfig = field(default_factory=MarketDataConfig)
 
     @property
     def is_paper_trading(self) -> bool:

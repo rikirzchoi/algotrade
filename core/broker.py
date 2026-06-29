@@ -209,6 +209,17 @@ class Broker(EWrapper, EClient):
             chartOptions=[],
         )
 
+    def cancel_historical_data(self, req_id: int) -> None:
+        """Cancel a keepUpToDate historical subscription (used to re-subscribe).
+
+        Safe to call on a possibly-dead stream; IB ignores unknown ids. Never
+        raises — the data watchdog must not be able to crash the event loop.
+        """
+        try:
+            self.cancelHistoricalData(req_id)
+        except Exception:
+            log.exception("cancel_historical_data failed for req_id=%d", req_id)
+
     def place_bracket_order(
         self,
         client_order_id: str,

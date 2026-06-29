@@ -98,6 +98,7 @@ class TradingEngine:
             "active_strategies": [],
             "fills_today": [],
             "error_count_today": 0,
+            "data_stale": False,
         }
         self._state_lock = threading.Lock()
 
@@ -115,6 +116,14 @@ class TradingEngine:
 
         # Periodic state update tracking
         self._last_periodic_update: float = 0.0
+
+        # Market-data staleness watchdog
+        self._last_realtime_bar_mono: float | None = None
+        self._data_stale: bool = False
+        self._prev_in_rth: bool = False
+        # (req_id, symbol, bar_size, duration) for each live subscription
+        self._subscriptions: list[tuple[int, str, str, str]] = []
+        self._next_req_id: int = 1
 
     # ------------------------------------------------------------------
     # Strategy registration
@@ -153,7 +162,11 @@ class TradingEngine:
                 self._broker.request_historical_data(
                     req_id, symbol, strategy.bar_size, duration
                 )
+                self._subscriptions.append(
+                    (req_id, symbol, strategy.bar_size, duration)
+                )
                 req_id += 1
+        self._next_req_id = req_id
 
         with self._state_lock:
             self._state["is_running"] = True
@@ -240,6 +253,7 @@ class TradingEngine:
                         strategy.on_bar(bar)
                         # Historical bars warm up indicators only — no orders
             elif kind == "realtime":
+                self._note_realtime_bar()
                 self._db.write(bar)
                 for strategy in self._strategies:
                     if self._strategy_wants(strategy, bar):
@@ -528,11 +542,120 @@ class TradingEngine:
             self._reset_done_today = True
             self._logger.info("Daily reset complete")
 
+    # ------------------------------------------------------------------
+    # Market-data staleness watchdog
+    # ------------------------------------------------------------------
+
+    def _note_realtime_bar(self) -> None:
+        """Record that a live bar arrived; clear any active staleness alert."""
+        self._last_realtime_bar_mono = time.monotonic()
+        if self._data_stale:
+            self._data_stale = False
+            with self._state_lock:
+                self._state["data_stale"] = False
+            self._logger.warning("Market data restored — live bars flowing again")
+            try:
+                self._notifier.notify_data_restored()
+            except Exception:
+                self._logger.exception("notify_data_restored failed")
+
+    def _is_rth(self, now_et: datetime) -> bool:
+        """True if now_et is within regular US equity trading hours (Mon–Fri).
+
+        Holiday-unaware: a market holiday would at worst produce one spurious
+        stale-alert, which is acceptable for a safety watchdog.
+        """
+        if now_et.weekday() >= 5:                 # Saturday / Sunday
+            return False
+        md = self._config.market_data
+        start = now_et.replace(hour=md.rth_start[0], minute=md.rth_start[1],
+                               second=0, microsecond=0)
+        end = now_et.replace(hour=md.rth_end[0], minute=md.rth_end[1],
+                             second=0, microsecond=0)
+        return start <= now_et < end
+
+    def _check_data_staleness(self, now_et: "datetime | None" = None,
+                              now_mono: "float | None" = None) -> None:
+        """Alert if no live bar has arrived for too long during trading hours.
+
+        Re-arms each session. ``now_et`` / ``now_mono`` are injectable for tests.
+        """
+        md = self._config.market_data
+        if not md.watchdog_enabled:
+            return
+        now_et = now_et if now_et is not None else datetime.now(_ET)
+        now_mono = now_mono if now_mono is not None else time.monotonic()
+
+        in_rth = self._is_rth(now_et)
+        # On the open transition, (re)start the clock and clear any prior alert.
+        if in_rth and not self._prev_in_rth:
+            self._last_realtime_bar_mono = now_mono
+            self._data_stale = False
+            with self._state_lock:
+                self._state["data_stale"] = False
+        self._prev_in_rth = in_rth
+        if not in_rth:
+            return
+
+        if self._last_realtime_bar_mono is None:
+            self._last_realtime_bar_mono = now_mono
+            return
+        elapsed = now_mono - self._last_realtime_bar_mono
+        if elapsed >= md.staleness_timeout_seconds and not self._data_stale:
+            self._data_stale = True
+            self._on_data_stale(int(elapsed // 60))
+
+    def _on_data_stale(self, minutes: int) -> None:
+        """Fire the loud alert for a market-data blackout (once per episode)."""
+        msg = (
+            f"DATA STALE: no live bar in ~{minutes} min during RTH. Engine "
+            f"connected but receiving no market data — strategies are blind and "
+            f"no orders will fire. Check TWS data subscription / data farm."
+        )
+        self._logger.error(msg)
+        with self._state_lock:
+            self._state["data_stale"] = True
+            self._state["error_count_today"] += 1
+        try:
+            self._db.write(SystemEvent(
+                kind=SystemEventKind.ERROR,
+                timestamp=datetime.now(_ET),
+                message=msg,
+            ))
+        except Exception:
+            self._logger.exception("Failed to persist data-stale event")
+        try:
+            self._notifier.notify_data_stale(minutes)
+        except Exception:
+            self._logger.exception("notify_data_stale failed")
+        if self._config.market_data.resubscribe_on_stale:
+            self._resubscribe_market_data()
+
+    def _resubscribe_market_data(self) -> None:
+        """Best-effort: cancel and re-request all keepUpToDate subscriptions.
+
+        Uses fresh req_ids to avoid colliding with a possibly-stuck id. Never
+        raises — the watchdog must not be able to crash the event loop.
+        """
+        try:
+            old = list(self._subscriptions)
+            self._subscriptions = []
+            for req_id, symbol, bar_size, duration in old:
+                self._broker.cancel_historical_data(req_id)
+                new_id = self._next_req_id
+                self._next_req_id += 1
+                self._broker.request_historical_data(new_id, symbol, bar_size, duration)
+                self._subscriptions.append((new_id, symbol, bar_size, duration))
+            self._logger.warning("Re-requested %d market-data subscriptions", len(old))
+        except Exception:
+            self._logger.exception("Market-data re-subscribe failed")
+
     def _maybe_update_state_periodic(self) -> None:
         """Refresh shared state approximately every 5 seconds."""
         now = time.monotonic()
         if now - self._last_periodic_update >= 5.0:
             self._update_state_periodic()
+            self._check_data_staleness()
             self._last_periodic_update = now
 
     def _update_state_on_fill(self, fill: FillEvent) -> None:
@@ -566,6 +689,8 @@ class _NullNotifier:
     def notify_connection_lost(self) -> None: pass
     def notify_connection_restored(self) -> None: pass
     def notify_engine_start(self, paper: bool) -> None: pass
+    def notify_data_stale(self, minutes: int) -> None: pass
+    def notify_data_restored(self) -> None: pass
     def start_daily_summary(self, engine: object) -> None: pass
 
 

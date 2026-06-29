@@ -77,6 +77,17 @@ class TelegramNotifier:
     def notify_connection_restored(self) -> None:
         self.send("✅ <b>Reconnected</b> — TWS connection restored.")
 
+    def notify_data_stale(self, minutes: int) -> None:
+        self.send(
+            f"🟠 <b>MARKET DATA STALE</b>\n"
+            f"No live bar in ~{minutes} min during trading hours. The engine is "
+            f"connected but receiving no data — strategies are blind, no orders "
+            f"will fire. Check TWS market-data subscription / data farm."
+        )
+
+    def notify_data_restored(self) -> None:
+        self.send("✅ <b>Market data restored</b> — live bars are flowing again.")
+
     def notify_engine_start(self, paper: bool) -> None:
         mode = "PAPER" if paper else "LIVE"
         self.send(f"🚀 <b>AlgoTrade started</b> ({mode} trading)")
