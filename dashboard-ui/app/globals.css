@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -24,38 +24,64 @@
     @apply bg-background text-zinc-100 font-sans;
     font-size: 14px;
     line-height: 1.5;
+    background-image: theme('backgroundImage.app-glow');
+    background-attachment: fixed;
   }
 
+  /* Numbers should never jiggle on update */
+  .tnum { font-variant-numeric: tabular-nums; font-feature-settings: 'tnum'; }
+
   /* Scrollbars */
-  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb {
     background: #3f3f46;
     border-radius: 99px;
   }
   ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+  ::selection { background: rgba(249,115,22,0.3); }
 }
 
 @layer components {
+  /* Card: top-lit gradient + hairline ring + soft shadow */
   .card {
-    @apply bg-surface border border-border rounded-xl;
+    @apply relative rounded-2xl border border-white/[0.08] bg-surface
+           bg-card-grad shadow-card;
+  }
+  .card-hover {
+    @apply transition-all duration-300 hover:shadow-card-hover
+           hover:border-white/[0.16] hover:-translate-y-0.5;
   }
 
-  .stat-accent-left {
-    position: relative;
-    overflow: hidden;
+  /* Glassy sticky header */
+  .glass {
+    @apply sticky top-0 z-30 border-b border-white/[0.06]
+           bg-background/70 backdrop-blur-xl;
   }
-  .stat-accent-left::before {
+
+  /* Section eyebrow label */
+  .eyebrow {
+    @apply text-[11px] font-semibold uppercase tracking-[0.12em] text-muted;
+  }
+
+  /* Skeleton shimmer */
+  .skeleton {
+    @apply relative overflow-hidden rounded-md bg-white/[0.04];
+  }
+  .skeleton::after {
     content: '';
-    position: absolute;
-    top: 0; left: 0;
-    width: 3px; height: 100%;
-    border-radius: 3px 0 0 3px;
+    @apply absolute inset-0 bg-shimmer animate-shimmer;
+    transform: translateX(-100%);
   }
-  .stat-accent-orange::before { background: #f97316; }
-  .stat-accent-red::before    { background: #ef4444; }
-  .stat-accent-green::before  { background: #22c55e; }
-  .stat-accent-zinc::before   { background: #52525b; }
+
+  /* Accent glow strip on stat cards */
+  .accent-bar {
+    @apply absolute inset-x-0 top-0 h-[2px];
+  }
+  .accent-orange { background: linear-gradient(90deg, transparent, #f97316, transparent); }
+  .accent-red    { background: linear-gradient(90deg, transparent, #ef4444, transparent); }
+  .accent-green  { background: linear-gradient(90deg, transparent, #22c55e, transparent); }
+  .accent-zinc   { background: linear-gradient(90deg, transparent, #52525b, transparent); }
 
   /* TradingView chart container */
   .tv-chart {
@@ -73,29 +99,28 @@
     @apply py-2 px-3 text-left text-[11px] font-medium uppercase tracking-widest text-muted;
   }
   .data-table tbody tr {
-    @apply border-b border-border/40 transition-colors;
+    @apply border-b border-white/[0.04] transition-colors;
   }
   .data-table tbody tr:last-child {
     @apply border-0;
   }
   .data-table tbody tr:hover {
-    @apply bg-zinc-800/30;
+    @apply bg-white/[0.03];
   }
   .data-table tbody td {
-    @apply py-3 px-3 text-zinc-300;
+    @apply py-3 px-3 text-zinc-300 tnum;
   }
 
   /* Nav item */
   .nav-item {
-    @apply flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium
-           text-muted transition-all cursor-pointer select-none;
+    @apply relative flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium
+           text-muted transition-colors cursor-pointer select-none;
   }
   .nav-item:hover {
-    @apply bg-zinc-800/60 text-zinc-300;
+    @apply bg-white/[0.04] text-zinc-200;
   }
   .nav-item.active {
-    @apply bg-zinc-800 text-zinc-100 border-l-2 border-accent;
-    padding-left: calc(0.75rem - 2px);
+    @apply text-zinc-100;
   }
 
   /* Badge */

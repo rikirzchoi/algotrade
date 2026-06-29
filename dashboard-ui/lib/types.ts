@@ -20,6 +20,7 @@ export interface EngineState {
   fills_today: Fill[]
   error_count_today: number
   last_heartbeat: string | null
+  data_stale: boolean
 }
 
 export interface EquityPoint {

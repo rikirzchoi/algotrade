@@ -107,6 +107,7 @@ def _state_payload() -> dict:
         "fills_today":       [_fill_to_dict(f) for f in state.get("fills_today", [])],
         "error_count_today": int(state.get("error_count_today", 0)),
         "last_heartbeat":    str(hb) if hb else None,
+        "data_stale":        bool(state.get("data_stale", False)),
     }
 
 

@@ -53,6 +53,7 @@ logs/
 # Node / Next.js dashboard (dashboard-ui/)
 node_modules/
 .next/
+*.tsbuildinfo
 
 # IBKR / TWS installers (downloaded binaries, not source)
 tws-latest-linux-x64.sh

@@ -59,25 +59,43 @@ export function EquityChart({ data, height = 300 }: Props) {
       byStrategy.set(pt.strategy_id, arr)
     }
 
+    const single = byStrategy.size === 1
     let colorIdx = 0
     for (const [, points] of byStrategy) {
-      const series = chart.addLineSeries({
-        color: COLORS[colorIdx++ % COLORS.length],
-        lineWidth: 2,
-        priceLineVisible: false,
-        lastValueVisible: true,
-        crosshairMarkerVisible: true,
-        crosshairMarkerRadius: 4,
-      })
       const sorted = [...points].sort(
         (a, b) => toTimestamp(a.exit_time) - toTimestamp(b.exit_time),
       )
-      series.setData(
-        sorted.map((p) => ({
-          time: toTimestamp(p.exit_time) as any,
-          value: p.cumulative_pnl,
-        })),
-      )
+      const seriesData = sorted.map((p) => ({
+        time: toTimestamp(p.exit_time) as any,
+        value: p.cumulative_pnl,
+      }))
+
+      if (single) {
+        // Single line → gradient area fill, tinted by final P&L sign.
+        const up = (sorted[sorted.length - 1]?.cumulative_pnl ?? 0) >= 0
+        const line = up ? '#22c55e' : '#ef4444'
+        const top = up ? 'rgba(34,197,94,0.28)' : 'rgba(239,68,68,0.28)'
+        const area = chart.addAreaSeries({
+          lineColor: line,
+          topColor: top,
+          bottomColor: 'rgba(0,0,0,0)',
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: true,
+          crosshairMarkerRadius: 4,
+        })
+        area.setData(seriesData)
+      } else {
+        const series = chart.addLineSeries({
+          color: COLORS[colorIdx++ % COLORS.length],
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: true,
+          crosshairMarkerVisible: true,
+          crosshairMarkerRadius: 4,
+        })
+        series.setData(seriesData)
+      }
     }
 
     chart.timeScale().fitContent()
