@@ -49,6 +49,42 @@ def _guess_ticker(sponsor: str) -> str:
     return ""
 
 
+# ── Noise filter ────────────────────────────────────────────────────────────
+# openFDA's approval feed includes medical gases, excipients, generics and
+# biosimilars — none of which are tradeable single-asset biotech catalysts. These
+# are logged with confirmed = -1 so they never reach manual review or the price
+# tracker (which acts only on confirmed == 1). The edge thesis lives in small
+# public biotechs whose stock actually moves on a single approval.
+GAS_EXCIPIENT_BRAND_TERMS = (
+    "MEDICAL AIR", "CARBON DIOXIDE", "NITROUS OXIDE", "NITROGEN", "HELIUM",
+    "OXYGEN", "DEHYDRATED ALCOHOL", "STERILE WATER", "SODIUM CHLORIDE",
+)
+GENERIC_BRAND_SUFFIXES = (
+    "HYDROCHLORIDE", "BROMIDE", "SULFATE", "MESYLATE", "PHOSPHATE", "ACETATE", "HCL",
+)
+GAS_SUPPLIER_SPONSOR_TERMS = ("WELDING", "OXYGEN", "AIR SERVICE", "AIRGAS", "CRYO")
+GENERIC_BIOSIMILAR_SPONSORS = (
+    "TEVA", "SANDOZ", "SAMSUNG BIOEPIS", "CELLTRION", "FRESENIUS", "ACCORD BIOPHARMA",
+    "BIOCON", "LUPIN", "APOTEX", "WOCKHARDT", "HIKMA", "AMNEAL", "DR REDDY",
+    "DR. REDDY", "VIATRIS", "MYLAN", "SUN PHARMA", "ZYDUS", "AUROBINDO",
+    "MEITHEAL", "B BRAUN", "HOSPIRA", "SAGENT", "EUGIA",
+)
+
+
+def classify_noise(sponsor: str, brand: str) -> str:
+    """Return a reason string if this is NOT a tradeable catalyst, else ''."""
+    s, b = sponsor.upper(), brand.upper().strip()
+    if b == "AIR" or any(t in b for t in GAS_EXCIPIENT_BRAND_TERMS):
+        return "medical-gas/excipient"
+    if any(b.endswith(suf) or f"{suf} " in b for suf in GENERIC_BRAND_SUFFIXES):
+        return "generic (chemical-name brand)"
+    if any(t in s for t in GAS_SUPPLIER_SPONSOR_TERMS):
+        return "gas/industrial supplier"
+    if any(t in s for t in GENERIC_BIOSIMILAR_SPONSORS):
+        return "generic/biosimilar maker"
+    return ""
+
+
 def fetch_approvals(start: str, end: str) -> list[dict]:
     """Original NDA/BLA approvals from openFDA between start/end (YYYYMMDD)."""
     url = "https://api.fda.gov/drug/drugsfda.json"
@@ -76,6 +112,7 @@ def fetch_approvals(start: str, end: str) -> list[dict]:
             continue
         sponsor = rec.get("sponsor_name", "")
         brand = (rec.get("products", [{}]) or [{}])[0].get("brand_name", "")
+        reason = classify_noise(sponsor, brand)
         rows.append({
             "event_date": appr.get("submission_status_date", ""),
             "event_type": "FDA_APPROVAL",
@@ -83,8 +120,8 @@ def fetch_approvals(start: str, end: str) -> list[dict]:
             "sponsor": sponsor,
             "brand": brand,
             "ticker": _guess_ticker(sponsor),
-            "confirmed": 0,
-            "notes": "",
+            "confirmed": -1 if reason else 0,
+            "notes": f"auto-filter: {reason}" if reason else "",
         })
     return rows
 
@@ -113,12 +150,16 @@ def main(lookback_days: int = 365) -> None:
         for r in sorted(new, key=lambda x: x["event_date"]):
             w.writerow(r)
 
-    mapped = sum(1 for r in new if r["ticker"])
-    print(f"  {len(rows)} approvals found, {len(new)} new added "
-          f"({mapped} auto-mapped, {len(new)-mapped} need manual ticker).")
+    filtered = sum(1 for r in new if r["confirmed"] == -1)
+    cand = [r for r in new if r["confirmed"] != -1]
+    mapped = sum(1 for r in cand if r["ticker"])
+    print(f"  {len(rows)} approvals found, {len(new)} new added.")
+    print(f"  {filtered} auto-filtered as non-catalyst (confirmed=-1); "
+          f"{len(cand)} tradeable candidates ({mapped} auto-mapped, "
+          f"{len(cand)-mapped} need a manual ticker).")
     print(f"  dataset: {OUT}  (total rows now {len(existing)+len(new)})")
-    print("  Next: fill blank tickers in the CSV (set confirmed=1), then a price"
-          " tracker records forward returns for each confirmed catalyst.")
+    print("  Next: review confirmed==0 rows — map the real small-caps and set"
+          " confirmed=1; a price tracker then records forward returns for those.")
 
 
 if __name__ == "__main__":
